@@ -102,12 +102,12 @@ class Config:
     # Протокол
     prompts: int = 24
     tokens: int = 400
-    results: str = os.path.join(ROOT, "results")
+    data: str = os.path.join(ROOT, "data")
 
 
 def save_data(cfg, data):
-    os.makedirs(cfg.results, exist_ok=True)
-    with open(os.path.join(cfg.results, "data.json"), "w") as f:
+    os.makedirs(cfg.data, exist_ok=True)
+    with open(os.path.join(cfg.data, "data.json"), "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
 
 
@@ -132,8 +132,8 @@ class ServerManager:
                 "--device", c.device]
 
     def launch(self, gguf):
-        os.makedirs(self.cfg.results, exist_ok=True)
-        log_path = os.path.join(self.cfg.results, f"server_{gguf}.log")
+        os.makedirs(self.cfg.data, exist_ok=True)
+        log_path = os.path.join(self.cfg.data, f"server_{gguf}.log")
         self.log_fh = open(log_path, "ab")
         print(f"[server] запуск: {' '.join(self._cmd(gguf))}", flush=True)
         self.proc = subprocess.Popen(
@@ -201,7 +201,7 @@ class ServerManager:
             if self.proc and self.proc.poll() is not None:
                 raise SystemExit(
                     f"[server] процесс завершился с кодом {self.proc.returncode}; "
-                    f"см. {self.cfg.results}/server_{gguf}.log")
+                    f"см. {self.cfg.data}/server_{gguf}.log")
             el = time.time() - t0
             if el - last >= 10:
                 print(f"[server] загрузка {gguf}... {int(el)} с", flush=True)
@@ -276,10 +276,10 @@ def score_texts_cxx(cfg, model_gguf, records, data, tag, field):
     if not os.path.isfile(SCORE_BIN):
         raise SystemExit(f"[score:{field}] нет {SCORE_BIN} — соберите "
                          f"score.cxx (см. README)")
-    os.makedirs(cfg.results, exist_ok=True)
+    os.makedirs(cfg.data, exist_ok=True)
     files = []
     for i, rec in enumerate(records):
-        p = os.path.join(cfg.results, f"{tag}_{i}.txt")
+        p = os.path.join(cfg.data, f"{tag}_{i}.txt")
         with open(p, "w") as f:
             f.write(rec["text"])
         files.append(p)
@@ -559,8 +559,8 @@ def main():
         tokens=args.tokens,
     )
 
-    os.makedirs(cfg.results, exist_ok=True)
-    data_path = os.path.join(cfg.results, "data.json")
+    os.makedirs(cfg.data, exist_ok=True)
+    data_path = os.path.join(cfg.data, "data.json")
     prompts = PROMPTS[:cfg.prompts]
 
     data = None
@@ -613,8 +613,10 @@ def main():
     a_syn = aggregate(np.array([r["mean_g"] for r in synth["wm"]]),
                       np.array([r["mean_g"] for r in synth["base"]]))
 
+    report_name = f"report_{cfg.wm_name}.json"
+    plot_name = f"watermark_report_{cfg.wm_name}.png"
     make_plot(cfg, llr_wm, llr_null, synth, a_llr,
-              os.path.join(cfg.results, "watermark_report.png"))
+              os.path.join(cfg.data, plot_name))
     print_report(cfg, synth, a_llr, a_syn)
 
     report = {
@@ -626,11 +628,11 @@ def main():
         "per_sequence_llr_null": [float(x) for x in llr_null],
         "per_sequence_mean_g_wm": [r["mean_g"] for r in synth["wm"]],
         "per_sequence_mean_g_base": [r["mean_g"] for r in synth["base"]],
-        "plot": os.path.join(cfg.results, "watermark_report.png"),
+        "plot": plot_name,
     }
-    with open(os.path.join(cfg.results, "report.json"), "w") as f:
+    with open(os.path.join(cfg.data, report_name), "w") as f:
         json.dump(report, f, ensure_ascii=False, indent=1)
-    print(f"[report] {os.path.join(cfg.results, 'report.json')}")
+    print(f"[report] {os.path.join(cfg.data, report_name)}")
 
 
 if __name__ == "__main__":

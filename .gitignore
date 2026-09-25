@@ -1,10 +1,10 @@
 # артефакты сборки
-/score
+score
 __pycache__/
 *.pyc
 
 # результаты прогонов
-results/
+data/
 
 # логи
 *.log

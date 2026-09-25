@@ -23,8 +23,8 @@ detect.py     # main: сервер, генерация, скоринг, анал
 score.cxx     # C++-скорер точных per-token logprob
 openstamp/    # сабмодуль: референс OpenStamp (METHOD.md)
 synthid-text/ # сабмодуль: референс SynthID-Text (модули)
-results/      # data.json, report.json, watermark_report.png, логи
-              # (не в git)
+data/         # data.json, report_<модель>.json, watermark_report_<модель>.png,
+              # логи (не в git)
 ```
 
 ## Установка
@@ -75,8 +75,8 @@ python3 detect.py --analyze-only                       # только анали
 
 ## Результат
 
-- `results/watermark_report.png` — 4 панели (LLR и G-значения);
-- `results/report.json` — все числа;
+- `data/watermark_report_<модель>.png` — 4 панели (LLR и G-значения);
+- `data/report_<модель>.json` — все числа (поле `plot` — относительное имя);
 - в stdout — отчёт с вердиктом по каждому детектору.
 
 ## Особенности
