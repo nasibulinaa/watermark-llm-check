@@ -2,50 +2,36 @@
 """
 Утилита детекции watermark в выводе LLM.
 
-Сравнивает две модели, сервируемые через llama.cpp:
-  - watermarked-кандидат (--wm-gguf),
-  - базовая модель для нулевой гипотезы (--base-gguf).
+Сравнивает две модели, сервируемые через llama.cpp: watermarked-кандидат
+и базовая модель для нулевой гипотезы. Два независимых детектора, по
+публичным референс-реализациям (оба — git-сабмодули этого проекта):
 
-Два независимых детектора, по публичным референс-реализациям
-(оба репозитория — git-сабмодули этого проекта):
+1) OpenStamp (openstamp/METHOD.md) — length-normalized log-likelihood
+   ratio между watermarked и базовой моделями:
 
-1) OpenStamp (openstamp/METHOD.md, https://github.com/mb-14/openstamp) —
-   length-normalized log-likelihood ratio между watermarked-чекпоинтом
-   и базовой моделью:
+       LLR(x) = (1/(T-1)) * Σ_t log[ p_wm(x_t|x_<t) / p_base(x_t|x_<t) ]
 
-       LLR(x) = (1/(T-1)) * sum_t log[ p_wm(x_t | x_<t) / p_base(x_t | x_<t) ]
+   Ключ не нужен. Порог τ калибруется эмпирически на непомеченном
+   (null) тексте (METHOD.md: "Thresholds are therefore calibrated
+   empirically").
 
-   Ключ не нужен: требуется доступ к обеим моделям. Watermarked-текст
-   накапливает положительный LLR; порог τ калибруется эмпирически на
-   непомеченном (null) тексте (METHOD.md: "Thresholds are therefore
-   calibrated empirically").
+2) SynthID-Text — G-значения: keyed-hash по (ngram_len-1)-контексту и
+   кандидат-токену, бинарные G на каждой глубине, training-free
+   weighted-mean детектор. Нулевое среднее G = 0.5 (Bernoulli-биты);
+   у watermarked-текста смещается вверх (~0.75). Используется
+   DEFAULT_WATERMARKING_CONFIG из репозитория (ngram_len=5, 30 ключей,
+   context_history_size=1024).
 
-2) SynthID-Text (https://github.com/google-deepmind/synthid-text):
-   G-значения — keyed-hash по (ngram_len-1)-контексту и кандидат-токену
-   (hashing_function.accumulate_hash), бинарные G на каждой глубине
-   (logits_processing.compute_g_values), training-free weighted-mean
-   детектор (detector_mean.mean_score). Нулевое среднее G = 0.5
-   (Bernoulli-биты); у watermarked-текста оно смещается вверх
-   (~0.75, g_value_expectations.expected_mean_g_value). Используется
-   DEFAULT_WATERMARKING_CONFIG из репозитория: ngram_len=5, 30 ключей,
-   context_history_size=1024.
-
-Фазы одного прогона:
-  1. WM   -> генерация N текстов (token ids) через llama-server.
-  2. BASE -> генерация N текстов.
-  3. Скоринг всех 2N текстов C++-скорером (score.cxx, собирается
-     ./build.sh против той же сборки llama.cpp; без speculative
-     decoding — точные log p(x_t|x_<t)): полная 2x2-матрица L-значений.
-     Logprobs генерации сервера не используются: при ngram-mod-draft
-     speculation ~11% позиций в них неточны (значения берутся из
-     draft-кэша).
-  4. Анализ: цифры, график results/watermark_report.png, вердикт.
+Фазы: генерация WM-текстов -> генерация base-текстов -> скоринг полной
+2x2-матрицы L-значений C++-скорером (score.cxx; точные log p(x_t|x_<t)
+без speculative decoding — logprobs сервера не используются, т.к. при
+ngram-mod-draft ~11% позиций в них неточны, значения из draft-кэша)
+-> анализ, отчёт, график.
 
 Запуск:
-  ./build.sh                          # собрать C++-скорер
-  python3 detect.py --models-dir /path/to/gguf
-  python3 detect.py --resume          # доскорить недостающие L
-  python3 detect.py --analyze-only    # только анализ + график + отчёт
+  python3 detect.py --models-dir /path/to/gguf   # полный прогон
+  python3 detect.py --resume                     # доскорить L
+  python3 detect.py --analyze-only               # только анализ + график
 """
 
 import argparse
@@ -95,13 +81,14 @@ PROMPTS = [
     "Напиши диалог между шахматистом и его тренером.",
 ]
 
+SCORE_BIN = os.path.join(ROOT, "score")
+
 
 @dataclass
 class Config:
-    # Дисплейные имена моделей (в отчёте)
+    # Дисплейные имена моделей (в отчёте) и GGUF-файлы в models_dir
     wm_name: str = "Swift-1.5-Qwen3.8-27B-GSQ-RCO"
     base_name: str = "Qwen3.8-27B-GSQ-RCO"
-    # GGUF-файлы в models_dir
     wm_gguf: str = "Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
     base_gguf: str = "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
     # Окружение
@@ -118,9 +105,6 @@ class Config:
     results: str = os.path.join(ROOT, "results")
 
 
-SCORE_BIN = os.path.join(ROOT, "score")
-
-
 def save_data(cfg, data):
     os.makedirs(cfg.results, exist_ok=True)
     with open(os.path.join(cfg.results, "data.json"), "w") as f:
@@ -128,11 +112,9 @@ def save_data(cfg, data):
 
 
 # --------------------------------------------------------------------------
-# Управление llama-server
+# Управление llama-server (одна модель в VRAM за раз)
 # --------------------------------------------------------------------------
 class ServerManager:
-    """Запускает/останавливает llama-server, держит одну модель в VRAM."""
-
     def __init__(self, cfg):
         self.cfg = cfg
         self.proc = None
@@ -198,8 +180,7 @@ class ServerManager:
         except requests.RequestException:
             return None
         js = r.json()
-        items = js.get("data") or js.get("models") or []
-        for m in items:
+        for m in js.get("data") or js.get("models") or []:
             st = m.get("status")
             if st is None or st == "loaded":
                 return m.get("id") or m.get("name")
@@ -228,7 +209,7 @@ class ServerManager:
             time.sleep(3)
         raise SystemExit("[server] модель не загрузилась за отведённое время")
 
-    def ensure_model(self, gguf, label):
+    def ensure_model(self, gguf):
         loaded = self.loaded_model()
         if self._match(loaded, gguf):
             print(f"[server] уже загружена: {loaded}")
@@ -243,7 +224,6 @@ class ServerManager:
 # --------------------------------------------------------------------------
 class Server:
     def __init__(self, cfg, model_id, timeout=900):
-        self.cfg = cfg
         self.base = f"http://{cfg.host}:{cfg.port}"
         self.s = requests.Session()
         self.s.headers["Content-Type"] = "application/json"
@@ -252,8 +232,9 @@ class Server:
 
     def generate(self, prompt, max_tokens,
                  temperature=1.0, top_k=20, top_p=0.95):
-        # logprobs=1 нужен только ради token id (для SynthID-детектора);
-        # сами logprobs сервера в скоринге не используются (draft-кэш).
+        """-> (text, token_ids). logprobs=1 нужен только ради token id
+        (для SynthID-детектора); сами logprobs сервера в скоринге не
+        используются (draft-кэш)."""
         r = self.s.post(f"{self.base}/v1/completions", json={
             "model": self.model_id,
             "prompt": prompt,
@@ -265,54 +246,36 @@ class Server:
             "stream": False,
         }, timeout=self.timeout)
         r.raise_for_status()
-        d = r.json()
-        ch = d["choices"][0]
-        toks = []
-        for t in (ch.get("logprobs") or {}).get("content") or []:
-            toks.append((int(t["id"]), t["token"], float(t["logprob"])))
-        return {"text": ch.get("text", ""), "tokens": toks,
-                "stop": ch.get("finish_reason")}
+        ch = r.json()["choices"][0]
+        ids = [int(t["id"])
+               for t in (ch.get("logprobs") or {}).get("content") or []]
+        return ch.get("text", ""), ids
 
 
 # --------------------------------------------------------------------------
 # Сбор данных
 # --------------------------------------------------------------------------
-def collect(cfg, server: Server, prompts, max_tokens, data, tag):
+def collect(cfg, server, prompts, max_tokens, data, tag):
     out = []
     t0 = time.time()
     for i, p in enumerate(prompts):
         print(f"[collect:{tag}] {i+1}/{len(prompts)}: {p[:60]!r} ...", flush=True)
-        g = server.generate(p, max_tokens)
-        rec = {
-            "prompt": p,
-            "text": g["text"],
-            "token_ids": [t[0] for t in g["tokens"]],
-            "token_texts": [t[1] for t in g["tokens"]],
-            "logprobs": [t[2] for t in g["tokens"]],
-            "n": len(g["tokens"]),
-            "stop": g["stop"],
-        }
-        out.append(rec)
+        text, ids = server.generate(p, max_tokens)
+        out.append({"prompt": p, "text": text, "token_ids": ids, "n": len(ids)})
         data[tag] = out
         save_data(cfg, data)
         el = time.time() - t0
         eta = el / (i + 1) * (len(prompts) - i - 1)
-        print(f"[collect:{tag}] {i+1}/{len(prompts)}: {len(g['tokens'])} tok, "
+        print(f"[collect:{tag}] {i+1}/{len(prompts)}: {len(ids)} tok, "
               f"прошло {el:.0f} с, ETA {eta:.0f} с", flush=True)
-    return out
 
 
 def score_texts_cxx(cfg, model_gguf, records, data, tag, field):
-    """Скоринг текстов C++-скорером, собранным на libllama этой же сборки.
-
-    L = sum_{t>=2} log p(x_t | x_<t) — точный (без speculative decoding,
-    в отличие от logprobs сервера с ngram-mod-draft, где ~11% позиций
-    берутся из draft-кэша и неточны). n_ctx скорер вычисляет сам из
-    размеров входных текстов.
-    """
+    """Скоринг текстов C++-скорером: L = Σ_{t>=2} log p(x_t|x_<t) под
+    указанной моделью. n_ctx скорер вычисляет сам из размеров текстов."""
     if not os.path.isfile(SCORE_BIN):
-        raise SystemExit(f"[score:{field}] нет бинарного скорера {SCORE_BIN} "
-                         f"— запустите ./build.sh")
+        raise SystemExit(f"[score:{field}] нет {SCORE_BIN} — соберите "
+                         f"score.cxx (см. README)")
     os.makedirs(cfg.results, exist_ok=True)
     files = []
     for i, rec in enumerate(records):
@@ -333,27 +296,19 @@ def score_texts_cxx(cfg, model_gguf, records, data, tag, field):
         if line.startswith("L="):
             parts = line.split()
             by_path[parts[2]] = float(parts[0][2:])
-    Ls = []
     for i, p in enumerate(files):
         if p not in by_path:
             raise SystemExit(f"[score:{field}] нет результата для {p}")
         data[tag][i][field] = by_path[p]
         save_data(cfg, data)
-        Ls.append(by_path[p])
     print(f"[score:{field}] готово за {time.time() - t0:.0f} с", flush=True)
-    return Ls
 
 
 # --------------------------------------------------------------------------
 # Детектор 1: OpenStamp (LLR)
 # --------------------------------------------------------------------------
 def openstamp_llrs(data):
-    """LLR для wm-текстов (сигнал) и base-текстов (нулевое распр.).
-
-    Оба L — из C++-скорера (точные log p(x_t|x_<t) под каждой моделью);
-    logprobs генерации сервера не используются: с ngram-mod-draft
-    speculation ~11% позиций в них неточно (draft-кэш).
-    """
+    """LLR: wm-тексты (сигнал) и base-тексты (нулевое распределение)."""
     llr_wm, llr_null = [], []
     for i in range(len(data["wm"])):
         n = data["wm"][i]["n"]
@@ -423,13 +378,12 @@ def synthid_scores(cfg, data, det):
 # --------------------------------------------------------------------------
 # Статистика и вердикт
 # --------------------------------------------------------------------------
-def aggregate(signal, null, name):
+def aggregate(signal, null):
     tau = float(null.mean() + 3 * null.std())
     hits = int((signal > tau).sum())
-    z_agg = float((signal.mean() - null.mean()) / (null.std() / math.sqrt(len(null))))
-    verdict = (hits >= 0.75 * len(signal)) and (z_agg >= 3.0)
+    z_agg = float((signal.mean() - null.mean())
+                  / (null.std() / math.sqrt(len(null))))
     return {
-        "name": name,
         "signal_mean": float(signal.mean()),
         "signal_median": float(np.median(signal)),
         "signal_min": float(signal.min()),
@@ -441,7 +395,7 @@ def aggregate(signal, null, name):
         "n": int(len(signal)),
         "hit_rate": hits / len(signal),
         "z_agg": z_agg,
-        "verdict": verdict,
+        "verdict": (hits >= 0.75 * len(signal)) and (z_agg >= 3.0),
     }
 
 
@@ -452,6 +406,9 @@ def make_plot(cfg, llr_wm, llr_null, synth, a_llr, res_path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
+    gw = np.array([r["mean_g"] for r in synth["wm"]])
+    gb = np.array([r["mean_g"] for r in synth["base"]])
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 8.5))
     fig.suptitle(f"Watermark detection: {cfg.wm_name} vs {cfg.base_name}\n"
@@ -469,8 +426,6 @@ def make_plot(cfg, llr_wm, llr_null, synth, a_llr, res_path):
     ax.legend()
 
     ax = axes[0][1]
-    gw = np.array([r["mean_g"] for r in synth["wm"]])
-    gb = np.array([r["mean_g"] for r in synth["base"]])
     ax.hist(gb, bins=12, alpha=0.55, color="tab:blue", label="base texts (null)")
     ax.hist(gw, bins=12, alpha=0.55, color="tab:red",
             label=f"{cfg.wm_name} texts (signal)")
@@ -511,7 +466,7 @@ def make_plot(cfg, llr_wm, llr_null, synth, a_llr, res_path):
 # --------------------------------------------------------------------------
 # Отчёт
 # --------------------------------------------------------------------------
-def print_report(cfg, llr_wm, llr_null, synth, a_llr, a_syn):
+def print_report(cfg, synth, a_llr, a_syn):
     gw = np.array([r["mean_g"] for r in synth["wm"]])
     gb = np.array([r["mean_g"] for r in synth["base"]])
     zw = np.array([r["z"] for r in synth["wm"]])
@@ -569,10 +524,6 @@ def main():
                     help="устройство сервера (llama.cpp -device)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8091)
-    ap.add_argument("--server-ctx", type=int, default=8192,
-                    help="-ctx-size сервера")
-    ap.add_argument("--server-batch", type=int, default=2048,
-                    help="-batch-size сервера")
     # Модели
     ap.add_argument("--wm-model", default="Swift-1.5-Qwen3.8-27B-GSQ-RCO",
                     help="имя watermarked-модели (в отчёте)")
@@ -587,9 +538,6 @@ def main():
     # Протокол
     ap.add_argument("--prompts", type=int, default=24)
     ap.add_argument("--tokens", type=int, default=400)
-    ap.add_argument("--results-dir",
-                    default=os.path.join(ROOT, "results"),
-                    help="каталог результатов")
     ap.add_argument("--analyze-only", action="store_true",
                     help="не собирать, только анализ по data.json")
     ap.add_argument("--resume", action="store_true",
@@ -607,11 +555,8 @@ def main():
         device=args.device,
         host=args.host,
         port=args.port,
-        server_ctx=args.server_ctx,
-        server_batch=args.server_batch,
         prompts=args.prompts,
         tokens=args.tokens,
-        results=args.results_dir,
     )
 
     os.makedirs(cfg.results, exist_ok=True)
@@ -642,13 +587,11 @@ def main():
         mgr = ServerManager(cfg)
         data = {}
         # Фаза 1: wm — генерация
-        model_id = mgr.ensure_model(cfg.wm_gguf, "wm")
-        server = Server(cfg, model_id)
-        collect(cfg, server, prompts, cfg.tokens, data, "wm")
+        model_id = mgr.ensure_model(cfg.wm_gguf)
+        collect(cfg, Server(cfg, model_id), prompts, cfg.tokens, data, "wm")
         # Фаза 2: base — генерация
-        model_id = mgr.ensure_model(cfg.base_gguf, "base")
-        server = Server(cfg, model_id)
-        collect(cfg, server, prompts, cfg.tokens, data, "base")
+        model_id = mgr.ensure_model(cfg.base_gguf)
+        collect(cfg, Server(cfg, model_id), prompts, cfg.tokens, data, "base")
         mgr.kill()  # освободить VRAM для C++-скорера
 
     # Скоринг (C++-скорер, сервер не нужен): полная 2x2-матрица L-значений
@@ -666,14 +609,13 @@ def main():
     det = SynthIDDetector()
     synth = synthid_scores(cfg, data, det)
 
-    a_llr = aggregate(llr_wm, llr_null, "llr")
+    a_llr = aggregate(llr_wm, llr_null)
     a_syn = aggregate(np.array([r["mean_g"] for r in synth["wm"]]),
-                      np.array([r["mean_g"] for r in synth["base"]]),
-                      "synthid")
+                      np.array([r["mean_g"] for r in synth["base"]]))
 
     make_plot(cfg, llr_wm, llr_null, synth, a_llr,
               os.path.join(cfg.results, "watermark_report.png"))
-    print_report(cfg, llr_wm, llr_null, synth, a_llr, a_syn)
+    print_report(cfg, synth, a_llr, a_syn)
 
     report = {
         "wm_model": cfg.wm_name,
