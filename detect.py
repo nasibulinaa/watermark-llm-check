@@ -102,9 +102,9 @@ class Config:
     base_gguf: str = "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
     # Окружение
     llama_bin: str = ("/home/alexey/mipt_mag_diploma-mipt_mag_diploma_private"
-                      "/llm/llama.cpp-rdna3/build/bin/llama-server")
+                      "/llm/llama.cpp/build_cuda/bin/llama-server")
     models_dir: str = "."
-    device: str = "ROCm1"
+    device: str = "cuda0"
     host: str = "127.0.0.1"
     port: int = 8091
     server_ctx: int = 8192
@@ -116,9 +116,13 @@ class Config:
 
 
 def save_data(cfg, data):
+    """Сохранить data.json (вызывается после каждого промпта/текста)."""
     os.makedirs(cfg.data, exist_ok=True)
-    with open(os.path.join(cfg.data, "data.json"), "w") as f:
+    path = os.path.join(cfg.data, "data.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
 
 
 # --------------------------------------------------------------------------
@@ -126,11 +130,13 @@ def save_data(cfg, data):
 # --------------------------------------------------------------------------
 class ServerManager:
     def __init__(self, cfg):
+        """cfg — Config; proc — дочерний процесс сервера; log_fh — лог."""
         self.cfg = cfg
         self.proc = None
         self.log_fh = None
 
     def _cmd(self, gguf):
+        """Команда запуска сервера для gguf (одна модель, фиксированный порт)."""
         c = self.cfg
         return [c.llama_bin,
                 "-m", os.path.join(c.models_dir, gguf),
@@ -142,6 +148,7 @@ class ServerManager:
                 "--device", c.device]
 
     def launch(self, gguf):
+        """Запустить сервер в фоне; лог — data/server_<gguf>.log (append)."""
         os.makedirs(self.cfg.data, exist_ok=True)
         log_path = os.path.join(self.cfg.data, f"server_{gguf}.log")
         self.log_fh = open(log_path, "ab")
@@ -225,6 +232,7 @@ class ServerManager:
         print("[server] остановлен", flush=True)
 
     def loaded_model(self):
+        """-> id загруженной модели (None, если сервер не отвечает)."""
         try:
             r = requests.get(f"http://{self.cfg.host}:{self.cfg.port}"
                              f"/v1/models", timeout=5)
@@ -239,6 +247,7 @@ class ServerManager:
         return None
 
     def _match(self, loaded, gguf):
+        """Совпадает ли id загруженной модели с gguf (id может не иметь .gguf)."""
         if not loaded:
             return False
         base = os.path.basename(loaded)
@@ -246,6 +255,7 @@ class ServerManager:
         return base == gguf or base == os.path.splitext(gguf)[0]
 
     def wait_ready(self, gguf, timeout=900):
+        """Ждать загрузки модели (по умолчанию до 900 с)."""
         t0 = time.time()
         last = 0.0
         while time.time() - t0 < timeout:
@@ -266,6 +276,7 @@ class ServerManager:
         raise SystemExit("[server] модель не загрузилась за отведённое время")
 
     def ensure_model(self, gguf):
+        """Загрузить gguf, если ещё не загружен (смена модели при несовпадении)."""
         loaded = self.loaded_model()
         if self._match(loaded, gguf):
             print(f"[server] уже загружена: {loaded}")
@@ -300,6 +311,7 @@ def gbnf_escape(s):
 
 class Server:
     def __init__(self, cfg, model_id, timeout=900):
+        """HTTP-клиент для одной модели; model_id — id из /v1/models."""
         self.base = f"http://{cfg.host}:{cfg.port}"
         self.s = requests.Session()
         self.s.headers["Content-Type"] = "application/json"
@@ -318,7 +330,7 @@ class Server:
             "temperature": temperature,
             "top_k": top_k,
             "top_p": top_p,
-            "logprobs": 1,
+            "logprobs": True, "top_logprobs": 1,
             "chat_template_kwargs": {"enable_thinking": reason},
             "stream": False,
         }, timeout=self.timeout)
@@ -344,7 +356,7 @@ class Server:
             "messages": [{"role": "user", "content": prompt}],
             "grammar": grammar,
             "max_tokens": n_tokens + 100,  # верхняя граница; грамматика сама завершает
-            "logprobs": 1,
+            "logprobs": True, "top_logprobs": 1,
             "temperature": 1.0,
             "top_k": 1,
             "chat_template_kwargs": {"enable_thinking": False},
@@ -364,19 +376,21 @@ class Server:
 # --------------------------------------------------------------------------
 # Сбор данных
 # --------------------------------------------------------------------------
-def collect(cfg, server, prompts, max_tokens, data, tag, mode):
-    out = []
+def collect(cfg, server, prompts, max_tokens, data, tag, mode, start=0):
+    """Сгенерировать N текстов (tag, mode); save_data после каждого.
+    start — индекс, с которого продолжить неполный сбор (--resume)."""
+    out = data.setdefault(tag, {}).setdefault(mode, [])
     t0 = time.time()
-    for i, p in enumerate(prompts):
+    for i in range(start, len(prompts)):
+        p = prompts[i]
         reason = (mode == "reason")
         print(f"[collect:{tag}:{mode}] {i+1}/{len(prompts)}: {p[:60]!r} ...",
               flush=True)
         text, ids = server.generate(p, max_tokens, reason=reason)
         out.append({"prompt": p, "text": text, "token_ids": ids, "n": len(ids)})
-        data.setdefault(tag, {})[mode] = out
         save_data(cfg, data)
         el = time.time() - t0
-        eta = el / (i + 1) * (len(prompts) - i - 1)
+        eta = el / (i - start + 1) * (len(prompts) - i - 1)
         print(f"[collect:{tag}:{mode}] {i+1}/{len(prompts)}: {len(ids)} tok, "
               f"прошло {el:.0f} с, ETA {eta:.0f} с", flush=True)
 
@@ -431,6 +445,7 @@ def openstamp_llrs(data):
 # --------------------------------------------------------------------------
 class SynthIDDetector:
     def __init__(self):
+        """SynthID-детектор; конфиг — DEFAULT_WATERMARKING_CONFIG (сабмодуль)."""
         from synthid_text import logits_processing
         from synthid_text.synthid_mixin import DEFAULT_WATERMARKING_CONFIG
         self.cfg = dict(DEFAULT_WATERMARKING_CONFIG)
@@ -487,6 +502,7 @@ def synthid_scores(cfg, data, det):
 # Статистика и вердикт
 # --------------------------------------------------------------------------
 def aggregate(signal, null):
+    """Сводка по signal/null: tau = mean+3std; verdict = (hits >= 75% n) и z_agg >= 3."""
     tau = float(null.mean() + 3 * null.std())
     hits = int((signal > tau).sum())
     z_agg = float((signal.mean() - null.mean())
@@ -511,6 +527,7 @@ def aggregate(signal, null):
 # График
 # --------------------------------------------------------------------------
 def make_plot(cfg, llrs, synth, aggs, res_path):
+    """2×2-график: LLR и mean G, reasoning on/off; сохранение в res_path."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -560,6 +577,7 @@ def make_plot(cfg, llrs, synth, aggs, res_path):
 # Отчёт
 # --------------------------------------------------------------------------
 def print_report(cfg, llrs, synth, aggs_llr, aggs_syn):
+    """Печатный отчёт: цифры и вердикт по каждому детектору и режиму."""
     print()
     print("=" * 78)
     print("  ИТОГОВЫЙ ОТЧЁТ: детекция watermark")
@@ -616,6 +634,7 @@ def print_report(cfg, llrs, synth, aggs_llr, aggs_syn):
 
 # --------------------------------------------------------------------------
 def main():
+    """CLI: сбор, скоринг, анализ, график, отчёт (смысл флагов — в --help)."""
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -705,13 +724,17 @@ def main():
             model_id = mgr.ensure_model(cfg.wm_gguf)
             srv = Server(cfg, model_id)
             for mode in MODES:
-                if mode not in data.get("wm", {}):
-                    collect(cfg, srv, prompts, cfg.tokens, data, "wm", mode)
+                have = len(data.get("wm", {}).get(mode, []))
+                if have < len(prompts):
+                    collect(cfg, srv, prompts, cfg.tokens, data, "wm",
+                            mode, start=have)
             model_id = mgr.ensure_model(cfg.base_gguf)
             srv = Server(cfg, model_id)
             for mode in MODES:
-                if mode not in data.get("base", {}):
-                    collect(cfg, srv, prompts, cfg.tokens, data, "base", mode)
+                have = len(data.get("base", {}).get(mode, []))
+                if have < len(prompts):
+                    collect(cfg, srv, prompts, cfg.tokens, data, "base",
+                            mode, start=have)
             # Фаза 2: скоринг под WM-моделью (L_wm)
             model_id = mgr.ensure_model(cfg.wm_gguf)
             srv = Server(cfg, model_id)

@@ -53,9 +53,8 @@ def main():
             done += (1 if lw and lb else 0)
             state = "готов" if lw and lb else (
                 "скоринг L_base" if lw else (
-                    "скоринг L_wm" if (lw or lb) else (
-                        "сбор" if n < 30 else "собран")))
-            print(f"{tag:5s}/{mode:9s}: {n:2d}/30 текстов, "
+                    "скоринг L_wm" if (lw or lb) else "собран"))
+            print(f"{tag:5s}/{mode:9s}: {n:2d} текстов, "
                   f"{toks:6d} ток., L_wm  {lw:2d}, L_base  {lb:2d}  [{state}]")
 
     print()

@@ -2,6 +2,8 @@
 """Smoke-тест: chat-completions + enable_thinking + grammar-score."""
 import requests
 
+from detect import gbnf_escape
+
 BASE = "http://127.0.0.1:8091"
 s = requests.Session()
 s.headers["Content-Type"] = "application/json"
@@ -29,7 +31,7 @@ def gen(prompt, reason, max_tokens=300):
         "temperature": 1.0,
         "top_k": 20,
         "top_p": 0.95,
-        "logprobs": 1,
+        "logprobs": True, "top_logprobs": 1,
         "chat_template_kwargs": {"enable_thinking": reason},
         "stream": False,
     }, timeout=300)
@@ -41,25 +43,13 @@ def gen(prompt, reason, max_tokens=300):
 
 
 def score(prompt, text, n_tokens):
-    out = []
-    for ch in text:
-        if ch == '"':
-            out.append('\\"')
-        elif ch == "\\":
-            out.append("\\\\")
-        elif ch == "\n":
-            out.append("\\n")
-        elif ch == "\t":
-            out.append("\\t")
-        else:
-            out.append(ch)
-    grammar = 'root ::= "' + "".join(out) + '"'
+    grammar = 'root ::= "' + gbnf_escape(text) + '"'
     r = s.post(f"{BASE}/v1/chat/completions", json={
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "grammar": grammar,
         "max_tokens": n_tokens + 100,
-        "logprobs": 1,
+        "logprobs": True, "top_logprobs": 1,
         "temperature": 1.0,
         "top_k": 1,
         "chat_template_kwargs": {"enable_thinking": False},
