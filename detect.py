@@ -670,16 +670,13 @@ def main():
     data_path = os.path.join(cfg.data, "data.json")
     prompts = PROMPTS[:cfg.prompts]
 
-    data = None
+    data = {}
     if args.analyze_only or args.resume:
         if not os.path.isfile(data_path):
             raise SystemExit(f"[config] нет {data_path} для --resume/"
                              f"--analyze-only")
         with open(data_path) as f:
             data = json.load(f)
-
-    if data is None:
-        data = {}
 
     def _missing():
         for tag in ("wm", "base"):
@@ -690,6 +687,10 @@ def main():
                     if "L_wm" not in r or "L_base" not in r:
                         return True
         return False
+
+    if _missing() and args.analyze_only:
+        raise SystemExit("[analyze-only] data.json не полон (нет полей L) — "
+                         "запустите полный прогон или --resume")
 
     if _missing():
         # Проверки окружения до долгого прогона

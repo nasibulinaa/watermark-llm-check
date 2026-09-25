@@ -21,6 +21,8 @@ git-сабмодули проекта):
 ```
 detect.py     # main: сервер, генерация, скоринг, анализ, отчёт
 test_llr.py   # эквивалентность по-токенного LLR и openstamp/src/llr.py
+smoke.py      # ручной smoke-тест сервера (thinking + grammar-score)
+status.py     # статус прогона по data.json
 openstamp/    # сабмодуль: референс OpenStamp (METHOD.md, src/llr.py)
 synthid-text/ # сабмодуль: референс SynthID-Text (модули)
 data/         # data.json, логи (не в git);
@@ -41,11 +43,12 @@ pip install -r requirements.txt   # numpy, requests, torch, matplotlib
 python3 detect.py --models-dir /path/to/gguf          # полный прогон
 python3 detect.py --resume                             # доскорить недостающие L
 python3 detect.py --analyze-only                       # только анализ + график
+python3 status.py                                      # статус прогона
 ```
 
 Полезные флаги (`--help` для списка): `--wm-gguf/--base-gguf` (файлы в
 `--models-dir`), `--wm-model/--base-model` (имена в отчёте), `--llama-bin`
-(бинарь llama-server), `--device` (`cuda0`/`cpu`), `--host`/`--port`,
+(бинарь llama-server), `--device` (например `cuda0`, `ROCm1`, `cpu`),
 `--prompts` (по умолчанию 30), `--tokens` (по умолчанию 400).
 
 ## Прогон
