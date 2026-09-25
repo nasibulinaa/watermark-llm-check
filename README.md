@@ -9,7 +9,7 @@ git-сабмодули проекта):
 
 - **OpenStamp** (`openstamp/METHOD.md`) — length-normalized log-likelihood
   ratio между watermarked и базовой моделями, ключ не нужен:
-  `LLR(x) = (1/(T-1)) * Σ_t log[ p_wm(x_t|x_<t) / p_base(x_t|x_<t) ]`.
+  $LLR(x) = \frac{1}{T-1}\sum_{t=1}^{T-1}\log\frac{p_{\text{wm}}(x_t \mid x_{<t})}{p_{\text{base}}(x_t \mid x_{<t})}$.
 - **SynthID-Text** (`synthid-text/`, Apache-2.0) — keyed-hash G-значения
   (ngram_len=5, 30 ключей, context_history_size=1024 из
   `DEFAULT_WATERMARKING_CONFIG`), training-free weighted-mean детектор.
@@ -20,10 +20,10 @@ git-сабмодули проекта):
 
 ```
 detect.py     # main: сервер, генерация, скоринг, анализ, отчёт
-score.cxx     # C++-скорер точных per-token logprob
-openstamp/    # сабмодуль: референс OpenStamp (METHOD.md)
+test_llr.py   # эквивалентность по-токенного LLR и openstamp/src/llr.py
+openstamp/    # сабмодуль: референс OpenStamp (METHOD.md, src/llr.py)
 synthid-text/ # сабмодуль: референс SynthID-Text (модули)
-data/         # data.json, логи, тексты (не в git);
+data/         # data.json, логи (не в git);
               # report_<модель>.json и watermark_report_<модель>.png — в git
 ```
 
@@ -34,20 +34,6 @@ git clone --recursive <url>
 cd watermark-llm-check
 pip install -r requirements.txt   # numpy, requests, torch, matplotlib
 ```
-
-## Сборка скорера
-
-Одна команда (нужна сборка llama.cpp, дающая `libllama.so` и заголовки):
-
-```
-c++ -O2 -std=c++17 -o score score.cxx \
-    -I<path/to/llama.cpp>/include \
-    -I<path/to/llama.cpp>/ggml/include \
-    -L<каталог с libllama.so> -Wl,-rpath,<каталог с libllama.so> \
-    -l:libllama.so -l:libggml.so -l:libggml-base.so -l:libggml-cpu.so -l:libggml-cuda.so
-```
-
-(для CPU-сборки — `libggml-cpu.so` вместо `libggml-cuda.so`.)
 
 ## Запуск
 
@@ -60,16 +46,17 @@ python3 detect.py --analyze-only                       # только анали
 Полезные флаги (`--help` для списка): `--wm-gguf/--base-gguf` (файлы в
 `--models-dir`), `--wm-model/--base-model` (имена в отчёте), `--llama-bin`
 (бинарь llama-server), `--device` (`cuda0`/`cpu`), `--host`/`--port`,
-`--prompts` (по умолчанию 24), `--tokens` (по умолчанию 400).
+`--prompts` (по умолчанию 30), `--tokens` (по умолчанию 400).
 
 ## Прогон
 
-1. **Генерация** — N текстов (по умолчанию 24) через llama-server; VRAM
+1. **Генерация** — N текстов (по умолчанию 30) через llama-server; VRAM
    ограничен, сервер перезапускается со второй моделью;
-2. **Скоринг** — C++-скорер считает L = Σ log p(x_t|x_<t) для полной 2×2
-   матрицы (wm/base тексты × wm/base модель) без speculative decoding
-   (logprobs сервера не используются — при ngram-mod-draft ~11% позиций
-   в них неточны);
+2. **Скоринг** — тот же сервер считает L = Σ log p(x_t|x_<t>) для полной
+   2×2-матрицы (wm/base тексты × wm/base модель): текст принудительно
+   генерируется через GBNF-грамматику, logprobs — pre-sampling (сырой
+   softmax, без влияния сэмплеров); сервер работает без speculative
+   decoding;
 3. **Анализ** — детекторы, отчёт, график.
 
 ## Результат
@@ -80,11 +67,11 @@ python3 detect.py --analyze-only                       # только анали
 
 ## Особенности
 
-- **n_ctx скорера** вычисляется сам из размеров текстов:
-  `max(2048, max_len + 1024)`.
-- **RAM**: скорер держит 2 модели × n_ctx simultaneously; при нехватке
-  памяти уменьшать `--tokens` или `--prompts`.
-- **VRAM**: сервер и C++-скорер не поднимаются одновременно.
+- **Всё через HTTP-API llama-server** — C++-сборка не нужна.
+- **logprobs сервера** — pre-sampling (сырой softmax по всему словарю),
+  поэтому скоринг точный; сервер поднимается без speculative decoding.
+- **VRAM**: в VRAM одна модель за раз; при нехватке памяти уменьшать
+  `--tokens` или `--prompts`.
 - **Логика детекции** — по METHOD.md (OpenStamp) и README (SynthID-Text).
 
 ## Лицензия

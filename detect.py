@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 Утилита детекции watermark в выводе LLM.
 
 Сравнивает две модели, сервируемые через llama.cpp: watermarked-кандидат
@@ -9,8 +9,11 @@
 1) OpenStamp (openstamp/METHOD.md) — length-normalized log-likelihood
    ratio между watermarked и базовой моделями:
 
-       LLR(x) = (1/(T-1)) * Σ_t log[ p_wm(x_t|x_<t) / p_base(x_t|x_<t) ]
+       $LLR(x) = \frac{1}{T-1}\sum_{t=1}^{T-1}\log\frac{p_{\text{wm}}(x_t \mid x_{<t})}{p_{\text{base}}(x_t \mid x_{<t})}$
 
+   Референс-реализация формулы: openstamp/src/llr.py
+   (length_normalized_llr); эквивалентность по-токенной версии
+   проверяется в test_llr.py.
    Ключ не нужен. Порог τ калибруется эмпирически на непомеченном
    (null) тексте (METHOD.md: "Thresholds are therefore calibrated
    empirically").
@@ -23,9 +26,9 @@
    context_history_size=1024).
 
 Фазы: генерация WM-текстов -> генерация base-текстов -> скоринг полной
-2x2-матрицы L-значений C++-скорером (score.cxx; точные log p(x_t|x_<t)
-без speculative decoding — logprobs сервера не используются, т.к. при
-ngram-mod-draft ~11% позиций в них неточны, значения из draft-кэша)
+2x2-матрицы L-значений самим llama-server (текст принудительно
+генерируется через GBNF-грамматику; logprobs сервера — pre-sampling,
+т.е. точные log p(x_t|x_<t); сервер работает без speculative decoding)
 -> анализ, отчёт, график.
 
 Запуск:
@@ -79,9 +82,13 @@ PROMPTS = [
     "Опиши, как приготовить борщ.",
     "Что такое квантовые вычисления? Объясни в одном абзаце.",
     "Напиши диалог между шахматистом и его тренером.",
+    "Write a Python function that merges two sorted lists in linear time. Explain the algorithm.",
+    "Write a C++ function that reverses a singly linked list in place. Explain the complexity.",
+    "Explain how a database index works. Give a PostgreSQL example with EXPLAIN.",
+    "Напиши функцию на Python, которая находит пересечение двух отсортированных списков за O(n).",
+    "Объясни, как устроена хеш-таблица. Приведи пример реализации на Python.",
+    "Напиши SQL-запрос: топ-3 товара по продажам за каждый месяц. Объясни оконные функции.",
 ]
-
-SCORE_BIN = os.path.join(ROOT, "score")
 
 
 @dataclass
@@ -100,7 +107,7 @@ class Config:
     server_ctx: int = 8192
     server_batch: int = 2048
     # Протокол
-    prompts: int = 24
+    prompts: int = 30
     tokens: int = 400
     data: str = os.path.join(ROOT, "data")
 
@@ -222,6 +229,26 @@ class ServerManager:
 # --------------------------------------------------------------------------
 # HTTP-клиент
 # --------------------------------------------------------------------------
+def gbnf_escape(s):
+    """Экранирует строку в GBNF-литерал."""
+    out = []
+    for ch in s:
+        if ch == '"':
+            out.append('\\"')
+        elif ch == '\\':
+            out.append('\\\\')
+        elif ch == '\n':
+            out.append('\\n')
+        elif ch == '\t':
+            out.append('\\t')
+        elif ch == '\r':
+            out.append('\\r')
+        elif ord(ch) < 0x20 or ord(ch) == 0x7f:
+            out.append('\\u%04x' % ord(ch))
+        else:
+            out.append(ch)
+    return ''.join(out)
+
 class Server:
     def __init__(self, cfg, model_id, timeout=900):
         self.base = f"http://{cfg.host}:{cfg.port}"
@@ -232,9 +259,8 @@ class Server:
 
     def generate(self, prompt, max_tokens,
                  temperature=1.0, top_k=20, top_p=0.95):
-        """-> (text, token_ids). logprobs=1 нужен только ради token id
-        (для SynthID-детектора); сами logprobs сервера в скоринге не
-        используются (draft-кэш)."""
+        """-> (text, token_ids). token ids нужны для SynthID-детектора
+        (G-значения); logprobs=1 — носитель для них."""
         r = self.s.post(f"{self.base}/v1/completions", json={
             "model": self.model_id,
             "prompt": prompt,
@@ -251,6 +277,36 @@ class Server:
                for t in (ch.get("logprobs") or {}).get("content") or []]
         return ch.get("text", ""), ids
 
+    def score(self, prompt, text, n_tokens):
+        """L = Σ log p(x_t | x_<t) под текущей моделью. Текст
+        принудительно генерируется GBNF-грамматикой; logprobs сервера
+        — pre-sampling (сырой softmax по всему словарю, без влияния
+        сэмплеров). -> (L, n_scored): n_scored может незначительно
+        превышать n_tokens — грамматика ре-токенизирует текст,
+        детокенизация не обратима."""
+        grammar = 'root ::= "' + gbnf_escape(text) + '"'
+        r = self.s.post(f"{self.base}/v1/completions", json={
+            "model": self.model_id,
+            "prompt": prompt,
+            "grammar": grammar,
+            "max_tokens": n_tokens + 100,  # верхняя граница; грамматика сама завершает
+            "logprobs": 1,
+            "temperature": 1.0,
+            "top_k": 1,
+            "stream": False,
+        }, timeout=self.timeout)
+        r.raise_for_status()
+        ch = r.json()["choices"][0]
+        gen = ch.get("text", "")
+        if gen != text:
+            raise SystemExit(f"[score] грамматика не зафиксировала текст: "
+                             f"{len(gen)} vs {len(text)} символов")
+        lps = (ch.get("logprobs") or {}).get("content") or []
+        if len(lps) < 2:
+            raise SystemExit("[score] в ответе нет logprobs")
+        # Первый текст-токен не входит: референс (openstamp/src/llr.py)
+        # считает с labels = input_ids[:, 2:]
+        return sum(t["logprob"] for t in lps[1:]), len(lps)
 
 # --------------------------------------------------------------------------
 # Сбор данных
@@ -270,52 +326,43 @@ def collect(cfg, server, prompts, max_tokens, data, tag):
               f"прошло {el:.0f} с, ETA {eta:.0f} с", flush=True)
 
 
-def score_texts_cxx(cfg, model_gguf, records, data, tag, field):
-    """Скоринг текстов C++-скорером: L = Σ_{t>=2} log p(x_t|x_<t) под
-    указанной моделью. n_ctx скорер вычисляет сам из размеров текстов."""
-    if not os.path.isfile(SCORE_BIN):
-        raise SystemExit(f"[score:{field}] нет {SCORE_BIN} — соберите "
-                         f"score.cxx (см. README)")
-    os.makedirs(cfg.data, exist_ok=True)
-    files = []
-    for i, rec in enumerate(records):
-        p = os.path.join(cfg.data, f"{tag}_{i}.txt")
-        with open(p, "w") as f:
-            f.write(rec["text"])
-        files.append(p)
-    model_path = os.path.join(cfg.models_dir, model_gguf)
-    print(f"[score:{field}] {len(files)} текстов <- {model_gguf}", flush=True)
+def score_texts_server(cfg, server, data, tag, field):
+    """Скоринг текстов сервером (GBNF-грамматики):
+    data[tag][i][field] = L, data[tag][i]["n_scored"] = n."""
+    todo = [i for i, r in enumerate(data[tag]) if field not in r]
+    if not todo:
+        return
+    print(f"[score:{field}] {len(todo)} текстов <- текущая модель", flush=True)
     t0 = time.time()
-    r = subprocess.run([SCORE_BIN, model_path] + files,
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        sys.stderr.write(r.stderr[-3000:] + "\n")
-        raise SystemExit(f"[score:{field}] скорер завершился с кодом {r.returncode}")
-    by_path = {}
-    for line in r.stdout.splitlines():
-        if line.startswith("L="):
-            parts = line.split()
-            by_path[parts[2]] = float(parts[0][2:])
-    for i, p in enumerate(files):
-        if p not in by_path:
-            raise SystemExit(f"[score:{field}] нет результата для {p}")
-        data[tag][i][field] = by_path[p]
+    for n, i in enumerate(todo):
+        rec = data[tag][i]
+        L, n_scored = server.score(rec["prompt"], rec["text"], rec["n"])
+        data[tag][i][field] = L
+        data[tag][i]["n_scored"] = n_scored
         save_data(cfg, data)
-    print(f"[score:{field}] готово за {time.time() - t0:.0f} с", flush=True)
+        el = time.time() - t0
+        eta = el / (n + 1) * (len(todo) - n - 1)
+        print(f"[score:{field}] {n+1}/{len(todo)}: L={L:.3f}, "
+              f"n_scored={n_scored}, прошло {el:.0f} с, ETA {eta:.0f} с",
+              flush=True)
 
 
 # --------------------------------------------------------------------------
 # Детектор 1: OpenStamp (LLR)
 # --------------------------------------------------------------------------
 def openstamp_llrs(data):
-    """LLR: wm-тексты (сигнал) и base-тексты (нулевое распределение)."""
+    """LLR: формула из openstamp/src/llr.py (length_normalized_llr) —
+    (Σ log p_wm − Σ log p_base) / N, N — число посчитанных токенов.
+    Референс-реализация работает с полными logits (B, T, V); здесь
+   используются по-токенные logprobs сервера (gather log_softmax по
+   позициям токенов) — эквивалентность проверяется в test_llr.py."""
     llr_wm, llr_null = [], []
     for i in range(len(data["wm"])):
-        n = data["wm"][i]["n"]
+        n = data["wm"][i].get("n_scored", data["wm"][i]["n"])
         llr_wm.append((data["wm"][i]["L_wm"] - data["wm"][i]["L_base"])
                       / max(n - 1, 1))
     for i in range(len(data["base"])):
-        n = data["base"][i]["n"]
+        n = data["base"][i].get("n_scored", data["base"][i]["n"])
         llr_null.append((data["base"][i]["L_wm"] - data["base"][i]["L_base"])
                         / max(n - 1, 1))
     return np.array(llr_wm), np.array(llr_null)
@@ -571,6 +618,18 @@ def main():
             data = json.load(f)
 
     if data is None:
+        data = {}
+
+    def _missing():
+        for tag in ("wm", "base"):
+            if tag not in data:
+                return True
+            for r in data[tag]:
+                if "L_wm" not in r or "L_base" not in r:
+                    return True
+        return False
+
+    if _missing():
         # Проверки окружения до долгого прогона
         if not os.path.isabs(cfg.llama_bin):
             found = shutil.which(cfg.llama_bin)
@@ -582,26 +641,30 @@ def main():
             p = os.path.join(cfg.models_dir, gguf)
             if not os.path.isfile(p):
                 raise SystemExit(f"[config] не найден GGUF: {p}")
-        # Полный прогон: генерация через сервер
+        # Генерация и скоринг через llama-server (одна модель в VRAM за раз)
         mgr = ServerManager(cfg)
-        data = {}
-        # Фаза 1: wm — генерация
+        # Фаза 1: генерация
         model_id = mgr.ensure_model(cfg.wm_gguf)
-        collect(cfg, Server(cfg, model_id), prompts, cfg.tokens, data, "wm")
-        # Фаза 2: base — генерация
+        if "wm" not in data:
+            collect(cfg, Server(cfg, model_id), prompts, cfg.tokens,
+                    data, "wm")
         model_id = mgr.ensure_model(cfg.base_gguf)
-        collect(cfg, Server(cfg, model_id), prompts, cfg.tokens, data, "base")
-        mgr.kill()  # освободить VRAM для C++-скорера
-
-    # Скоринг (C++-скорер, сервер не нужен): полная 2x2-матрица L-значений
-    for tag, model_gguf, field in (
-            ("wm", cfg.wm_gguf, "L_wm"),
-            ("wm", cfg.base_gguf, "L_base"),
-            ("base", cfg.wm_gguf, "L_wm"),
-            ("base", cfg.base_gguf, "L_base"),
-    ):
-        if any(field not in r for r in data[tag]):
-            score_texts_cxx(cfg, model_gguf, data[tag], data, tag, field)
+        if "base" not in data:
+            collect(cfg, Server(cfg, model_id), prompts, cfg.tokens,
+                    data, "base")
+        # Фаза 2: скоринг под WM-моделью (L_wm)
+        model_id = mgr.ensure_model(cfg.wm_gguf)
+        srv = Server(cfg, model_id)
+        for tag in ("wm", "base"):
+            if any("L_wm" not in r for r in data[tag]):
+                score_texts_server(cfg, srv, data, tag, "L_wm")
+        # Фаза 3: скоринг под BASE-моделью (L_base)
+        model_id = mgr.ensure_model(cfg.base_gguf)
+        srv = Server(cfg, model_id)
+        for tag in ("wm", "base"):
+            if any("L_base" not in r for r in data[tag]):
+                score_texts_server(cfg, srv, data, tag, "L_base")
+        mgr.kill()
 
     # Анализ
     llr_wm, llr_null = openstamp_llrs(data)
