@@ -350,12 +350,18 @@ class Server:
         n_tokens — грамматика ре-токенизирует текст, детокенизация
         не обратима. Первый текст-токен не входит: референс
         (openstamp/src/llr.py) считает с labels = input_ids[:, 2:]."""
+        if not text:
+            raise SystemExit("[score] пустой текст — строка исключена из "
+                             "скоринга (см. score_texts_server)")
         grammar = 'root ::= "' + gbnf_escape(text) + '"'
         r = self.s.post(f"{self.base}/v1/chat/completions", json={
             "model": self.model_id,
             "messages": [{"role": "user", "content": prompt}],
             "grammar": grammar,
-            "max_tokens": n_tokens + 100,  # верхняя граница; грамматика сама завершает
+            "max_tokens": n_tokens + 1000,
+            # верхняя граница с запасом: ре-токенизация текста может
+            # добавить ~15% токенов (наблюдаемо +149 к 973); сама
+            # грамматика завершает генерацию по завершении текста
             "logprobs": True, "top_logprobs": 1,
             "temperature": 1.0,
             "top_k": 1,
@@ -370,7 +376,8 @@ class Server:
                              f"{len(gen)} vs {len(text)} символов")
         lps = (ch.get("logprobs") or {}).get("content") or []
         if len(lps) < 2:
-            raise SystemExit("[score] в ответе нет logprobs")
+            raise SystemExit(f"[score] в ответе мало logprobs: {len(lps)} "
+                             f"при {len(text)} символах текста")
         return sum(t["logprob"] for t in lps[1:]), len(lps)
 
 # --------------------------------------------------------------------------
@@ -397,9 +404,16 @@ def collect(cfg, server, prompts, max_tokens, data, tag, mode, start=0):
 
 def score_texts_server(cfg, server, data, tag, mode, field):
     """Скоринг текстов сервером (GBNF-грамматики):
-    data[tag][mode][i][field] = L, data[tag][mode][i]["n_scored"] = n."""
+    data[tag][mode][i][field] = L, data[tag][mode][i]["n_scored"] = n.
+    Строки с пустым текстом пропускаются (модель зациклилась на
+    спец-токенах — скоринг вырожден)."""
     rows = data[tag][mode]
     todo = [i for i, r in enumerate(rows) if field not in r]
+    skip = [i for i in todo if not rows[i]["text"].strip()]
+    todo = [i for i in todo if rows[i]["text"].strip()]
+    if skip:
+        print(f"[score:{field}:{tag}:{mode}] пропущено пустых текстов: "
+              f"{skip} (модель зациклилась на спец-токенах)", flush=True)
     if not todo:
         return
     print(f"[score:{field}:{tag}:{mode}] {len(todo)} текстов <- текущая модель",
@@ -435,7 +449,9 @@ def openstamp_llrs(data):
             vals[tag] = np.array([
                 (rec["L_wm"] - rec["L_base"])
                 / max(rec.get("n_scored", rec["n"]) - 1, 1)
-                for rec in data[tag][mode]])
+                for rec in data[tag][mode]
+                if rec.get("text", "").strip()
+                and "L_wm" in rec and "L_base" in rec])
         out[mode] = (vals["wm"], vals["base"])
     return out
 
@@ -490,6 +506,8 @@ def synthid_scores(cfg, data, det):
         for mode in MODES:
             rows = []
             for rec in data[tag][mode]:
+                if not rec.get("text", "").strip():
+                    continue
                 g, z, M = det.score(rec["token_ids"])
                 rows.append({"mean_g": g, "z": z, "M": M})
                 rec["synthid"] = rows[-1]
@@ -697,6 +715,8 @@ def main():
                 if tag not in data or mode not in data.get(tag, {}):
                     return True
                 for r in data[tag][mode]:
+                    if not r.get("text", "").strip():
+                        continue
                     if "L_wm" not in r or "L_base" not in r:
                         return True
         return False
@@ -764,6 +784,12 @@ def main():
         aggs_syn[mode] = aggregate(
             np.array([r["mean_g"] for r in synth["wm"][mode]]),
             np.array([r["mean_g"] for r in synth["base"][mode]]))
+    n_empty = sum(
+        1 for tag in ("wm", "base") for mode in MODES
+        for r in data[tag][mode] if not r.get("text", "").strip())
+    if n_empty:
+        print(f"[report] исключено текстов с пустым выходом "
+              f"(зацикливание на спец-токенах): {n_empty}")
 
     report_name = f"report_{cfg.wm_name}.json"
     plot_name = f"watermark_report_{cfg.wm_name}.png"

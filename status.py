@@ -5,7 +5,9 @@
 - сколько текстов собрано по каждому (модель, режим)
 - сколько токенов
 - сколько текстов уже посчитано под L_wm / L_base
-- мtime файла и текущий llama-server
+- пустые тексты (модель зациклилась на спец-токенах) не скорятся —
+  в знаменателе число непустых
+- mtime файла и текущий llama-server
 
 Запуск: python3 status.py [путь к data.json]
 """
@@ -46,16 +48,23 @@ def main():
         for mode in data[tag]:
             recs = data[tag][mode]
             n = len(recs)
-            toks = sum(r.get("n", 0) for r in recs)
+            # Строки с пустым текстом (зацикливание на спец-токенах)
+            # detect.py не скорит — знаменатель = число непустых
+            text_rows = [r for r in recs if r.get("text", "").strip()]
+            n_text = len(text_rows)
+            n_empty = n - n_text
+            toks = sum(r.get("n", 0) for r in text_rows)
             lw = sum(1 for r in recs if "L_wm" in r)
             lb = sum(1 for r in recs if "L_base" in r)
-            total += n
-            done += (1 if lw and lb else 0)
-            state = "готов" if lw and lb else (
-                "скоринг L_base" if lw else (
+            total += n_text
+            done += (1 if lw >= n_text and lb >= n_text else 0)
+            state = "готов" if (lw >= n_text and lb >= n_text) else (
+                "скоринг L_base" if lw >= n_text else (
                     "скоринг L_wm" if (lw or lb) else "собран"))
-            print(f"{tag:5s}/{mode:9s}: {n:2d} текстов, "
-                  f"{toks:6d} ток., L_wm  {lw:2d}, L_base  {lb:2d}  [{state}]")
+            extra = f" (пустых: {n_empty})" if n_empty else ""
+            print(f"{tag:5s}/{mode:9s}: {n:2d} текстов{extra}, "
+                  f"{toks:6d} ток., L_wm  {lw:2d}/{n_text:2d}, "
+                  f"L_base {lb:2d}/{n_text:2d}  [{state}]")
 
     print()
     print(f"итого: {total} текстов собрано, {done} полностью посчитаны")
