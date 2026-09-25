@@ -360,8 +360,9 @@ class Server:
             "grammar": grammar,
             "max_tokens": n_tokens + 1000,
             # верхняя граница с запасом: ре-токенизация текста может
-            # добавить ~15% токенов (наблюдаемо +149 к 973); сама
-            # грамматика завершает генерацию по завершении текста
+            # добавить ~15% токенов (наблюдаемо +149 к 973); после
+            # завершения грамматики сервер продолжает свободную
+            # генерацию до max_tokens (лишние токены в ответ не входят)
             "logprobs": True, "top_logprobs": 1,
             "temperature": 1.0,
             "top_k": 1,
@@ -372,8 +373,16 @@ class Server:
         ch = r.json()["choices"][0]
         gen = ch.get("message", {}).get("content", "")
         if gen != text:
-            raise SystemExit(f"[score] грамматика не зафиксировала текст: "
-                             f"{len(gen)} vs {len(text)} символов")
+            # Round-trip tok(text)→detok не обратим: грамматика
+            # фиксирует токен-последовательность текста, а детокенизация
+            # может терять/добавлять немного символов (границы
+            # токенов). Принимаем почти-равный текст в обоих
+            # направлениях; свободная генерация расходится сразу.
+            ok = (text.startswith(gen) or gen.startswith(text)) \
+                 and abs(len(gen) - len(text)) <= max(10, len(text) // 10)
+            if not ok:
+                raise SystemExit(f"[score] грамматика не зафиксировала текст: "
+                                 f"{len(gen)} vs {len(text)} символов")
         lps = (ch.get("logprobs") or {}).get("content") or []
         if len(lps) < 2:
             raise SystemExit(f"[score] в ответе мало logprobs: {len(lps)} "
