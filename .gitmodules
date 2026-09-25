@@ -1,0 +1,6 @@
+[submodule "openstamp"]
+	path = openstamp
+	url = https://github.com/mb-14/openstamp
+[submodule "synthid-text"]
+	path = synthid-text
+	url = https://github.com/google-deepmind/synthid-text
