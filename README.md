@@ -23,8 +23,8 @@ detect.py     # main: сервер, генерация, скоринг, анал
 score.cxx     # C++-скорер точных per-token logprob
 openstamp/    # сабмодуль: референс OpenStamp (METHOD.md)
 synthid-text/ # сабмодуль: референс SynthID-Text (модули)
-data/         # data.json, report_<модель>.json, watermark_report_<модель>.png,
-              # логи (не в git)
+data/         # data.json, логи, тексты (не в git);
+              # report_<модель>.json и watermark_report_<модель>.png — в git
 ```
 
 ## Установка
