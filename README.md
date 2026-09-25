@@ -43,7 +43,7 @@ pip install -r requirements.txt   # numpy, requests, torch, matplotlib
 c++ -O2 -std=c++17 -o score score.cxx \
     -I<path/to/llama.cpp>/include \
     -I<path/to/llama.cpp>/ggml/include \
-    -L<path/to/llama.cpp>/build -Wl,-rpath,<path/to/llama.cpp>/build \
+    -L<каталог с libllama.so> -Wl,-rpath,<каталог с libllama.so> \
     -l:libllama.so -l:libggml.so -l:libggml-base.so -l:libggml-cpu.so -l:libggml-cuda.so
 ```
 
@@ -64,14 +64,13 @@ python3 detect.py --analyze-only                       # только анали
 
 ## Прогон
 
-1. `WM-генерация` — 24 текста с logprobs через llama-server;
-2. `BASE-генерация` — те же промпты, вторая модель (VRAM ограничен:
-   сервер перезапускается с новой моделью);
-3. `СКОРИНГ` — C++-скорер считает L = Σ log p(x_t|x_<t) для полной 2×2
-   матрицы (wm/base тексты × wm/base модель) без speculative decoding —
-   logprobs сервера не используются, т.к. при ngram-mod-draft ~11%
-   позиций в них неточны (значения из draft-кэша);
-4. `АНАЛИЗ` — детекторы, отчёт, график.
+1. **Генерация** — N текстов (по умолчанию 24) через llama-server; VRAM
+   ограничен, сервер перезапускается со второй моделью;
+2. **Скоринг** — C++-скорер считает L = Σ log p(x_t|x_<t) для полной 2×2
+   матрицы (wm/base тексты × wm/base модель) без speculative decoding
+   (logprobs сервера не используются — при ngram-mod-draft ~11% позиций
+   в них неточны);
+3. **Анализ** — детекторы, отчёт, график.
 
 ## Результат
 
@@ -81,8 +80,8 @@ python3 detect.py --analyze-only                       # только анали
 
 ## Особенности
 
-- **n_ctx скорера** вычисляется сам из размеров текстов (max_len+16);
-  не задавать вручную.
+- **n_ctx скорера** вычисляется сам из размеров текстов:
+  `max(2048, max_len + 1024)`.
 - **RAM**: скорер держит 2 модели × n_ctx simultaneously; при нехватке
   памяти уменьшать `--tokens` или `--prompts`.
 - **VRAM**: сервер и C++-скорер не поднимаются одновременно.

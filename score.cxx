@@ -1,16 +1,15 @@
 // Exact per-token logprob scorer for watermark LLR detection.
-// For a text T (optionally continued from a prompt P):
-//   L = sum over text tokens j=1..k-1 of log p(T_j | P, T_0..T_{j-1})
+// For a text T:
+//   L = sum over text tokens j=1..k-1 of log p(T_j | T_0..T_{j-1})
 // Matches the server's generation-logprob convention (logprobs[1:]).
 // Strictly llama.cpp: links the same build's libllama/libggml.
 //
-// n_ctx is computed from the input sizes (not fixed):
-//   auto: n_ctx = max over files of (|prompt| + |text|) + 1024, floor 2048.
-//   override: --ctx N (N > 0).
+// n_ctx is computed from the input sizes: n_ctx = max(2048, max_len + 1024),
+// where max_len is the longest input file in tokens.
 // n_batch is clamped to n_ctx (a batch larger than the context is an
 // invalid configuration in this build).
 //
-// Usage: score model.gguf [--prompt promptfile] [--ctx N] file1 [file2 ...]
+// Usage: score model.gguf file1 [file2 ...]
 #include "llama.h"
 
 #include <algorithm>
@@ -42,8 +41,7 @@ static std::vector<llama_token> load_tokens(const llama_vocab * vocab, const cha
 }
 
 static int score_tokens(llama_context * ctx, const char * path, int n_vocab,
-                        const std::vector<llama_token> & text_tokens,
-                        const std::vector<llama_token> * prompt_tokens) {
+                        const std::vector<llama_token> & text_tokens) {
     llama_memory_clear(llama_get_memory(ctx), true);
 
     const int k = (int) text_tokens.size();
@@ -52,23 +50,15 @@ static int score_tokens(llama_context * ctx, const char * path, int n_vocab,
         return 0;
     }
 
-    const int n_prompt = prompt_tokens ? (int) prompt_tokens->size() : 0;
-    std::vector<llama_token> tokens;
-    if (n_prompt > 0) {
-        tokens.insert(tokens.end(), prompt_tokens->begin(), prompt_tokens->end());
-    }
-    tokens.insert(tokens.end(), text_tokens.begin(), text_tokens.end());
-    const int N = (int) tokens.size();
-
-    llama_batch batch = llama_batch_init(N, 0, 1);
-    batch.n_tokens = N;
+    llama_batch batch = llama_batch_init(k, 0, 1);
+    batch.n_tokens = k;
     batch.embd = nullptr;
-    for (int i = 0; i < N; ++i) {
-        batch.token[i] = tokens[i];
+    for (int i = 0; i < k; ++i) {
+        batch.token[i] = text_tokens[i];
         batch.pos[i] = i;
         batch.n_seq_id[i] = 1;
         batch.seq_id[i][0] = 0;
-        batch.logits[i] = 1; // logits на всех позициях
+        batch.logits[i] = 1;
     }
     if (llama_decode(ctx, batch)) {
         std::fprintf(stderr, "error: llama_decode failed for %s\n", path);
@@ -76,7 +66,7 @@ static int score_tokens(llama_context * ctx, const char * path, int n_vocab,
         return 1;
     }
 
-    const float * logits = llama_get_logits(ctx); // (N-1) vectors: position 1..N-1
+    const float * logits = llama_get_logits(ctx); // (k-1) vectors: positions 1..k-1
     if (!logits) {
         std::fprintf(stderr, "error: no logits for %s\n", path);
         llama_batch_free(batch);
@@ -85,8 +75,7 @@ static int score_tokens(llama_context * ctx, const char * path, int n_vocab,
 
     double L = 0.0;
     for (int j = 1; j < k; ++j) { // skip first text token, like server logprobs[1:]
-        const int pos = n_prompt + j;
-        const float * row = logits + (size_t)(pos - 1) * n_vocab;
+        const float * row = logits + (size_t)(j - 1) * n_vocab;
         const llama_token tok = text_tokens[j];
         float m = -1e30f;
         for (int v = 0; v < n_vocab; ++v) m = std::max(m, row[v]);
@@ -104,28 +93,7 @@ static int score_tokens(llama_context * ctx, const char * path, int n_vocab,
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     if (argc < 3) {
-        std::fprintf(stderr,
-                     "usage: %s model.gguf [--prompt promptfile] [--ctx N] file1 [file2 ...]\n",
-                     argv[0]);
-        return 1;
-    }
-
-    std::string prompt_path;
-    int ctx_arg = 0; // 0 = auto
-    int first_file = 2;
-    for (int a = 2; a < argc; ++a) {
-        const std::string s = argv[a];
-        if (s == "--prompt" && a + 1 < argc) {
-            prompt_path = argv[++a];
-        } else if (s == "--ctx" && a + 1 < argc) {
-            ctx_arg = std::atoi(argv[++a]);
-        } else {
-            first_file = a;
-            break;
-        }
-    }
-    if (argc <= first_file) {
-        std::fprintf(stderr, "error: no text files given\n");
+        std::fprintf(stderr, "usage: %s model.gguf file1 [file2 ...]\n", argv[0]);
         return 1;
     }
 
@@ -141,11 +109,11 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
-    // Pre-tokenize all inputs: n_ctx must cover the longest (prompt + text).
+    // Pre-tokenize all inputs: n_ctx must cover the longest file.
     std::vector<std::vector<llama_token> > all_tokens;
-    all_tokens.reserve(argc - first_file);
+    all_tokens.reserve(argc - 2);
     int max_text_len = 0;
-    for (int a = first_file; a < argc; ++a) {
+    for (int a = 2; a < argc; ++a) {
         bool ok = true;
         std::vector<llama_token> t = load_tokens(vocab, argv[a], &ok);
         if (!ok) {
@@ -158,30 +126,13 @@ int main(int argc, char ** argv) {
         all_tokens.push_back(std::move(t));
     }
 
-    std::vector<llama_token> prompt_tokens;
-    const std::vector<llama_token> * pt = nullptr;
-    if (!prompt_path.empty()) {
-        bool pok = true;
-        prompt_tokens = load_tokens(vocab, prompt_path.c_str(), &pok);
-        if (!pok) {
-            std::fprintf(stderr, "error: failed to load prompt %s\n", prompt_path.c_str());
-            llama_model_free(model);
-            llama_backend_free();
-            return 1;
-        }
-        pt = &prompt_tokens;
-    }
-
-    // Context: enough for the longest input + margin, floored at 2048.
-    const int max_len = max_text_len + (pt ? (int) prompt_tokens.size() : 0);
-    const int auto_ctx = std::max(2048, max_len + 1024);
-    const int n_ctx = ctx_arg > 0 ? ctx_arg : auto_ctx;
-    std::printf("ctx: n_ctx=%d (max input=%d, auto=%d)\n", n_ctx, max_len, auto_ctx);
+    const int auto_ctx = std::max(2048, max_text_len + 1024);
+    std::printf("ctx: n_ctx=%d (max input=%d)\n", auto_ctx, max_text_len);
     std::fflush(stdout);
 
     llama_context_params cp = {};
-    cp.n_ctx = n_ctx;
-    cp.n_batch = std::min(4096, n_ctx);
+    cp.n_ctx = auto_ctx;
+    cp.n_batch = std::min(4096, auto_ctx);
     cp.offload_kqv = false; // KV-кэш в RAM (как --cache-ram у сервера),
                             // экономим VRAM для весов модели
     llama_context * ctx = llama_init_from_model(model, cp);
@@ -194,7 +145,7 @@ int main(int argc, char ** argv) {
 
     int rc = 0;
     for (size_t a = 0; a < all_tokens.size(); ++a) {
-        rc |= score_tokens(ctx, argv[first_file + a], n_vocab, all_tokens[a], pt);
+        rc |= score_tokens(ctx, argv[2 + a], n_vocab, all_tokens[a]);
     }
 
     llama_free(ctx);

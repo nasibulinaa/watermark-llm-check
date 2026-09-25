@@ -559,7 +559,6 @@ def main():
         tokens=args.tokens,
     )
 
-    os.makedirs(cfg.data, exist_ok=True)
     data_path = os.path.join(cfg.data, "data.json")
     prompts = PROMPTS[:cfg.prompts]
 
