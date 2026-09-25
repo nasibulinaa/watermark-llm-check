@@ -25,11 +25,12 @@ r"""
    DEFAULT_WATERMARKING_CONFIG из репозитория (ngram_len=5, 30 ключей,
    context_history_size=1024).
 
-Фазы: генерация WM-текстов -> генерация base-текстов -> скоринг полной
+Фазы: генерация WM-текстов -> генерация base-текстов (оба режима:
+с reasoning и без, Qwen3 enable_thinking) -> скоринг полной
 2x2-матрицы L-значений самим llama-server (текст принудительно
 генерируется через GBNF-грамматику; logprobs сервера — pre-sampling,
 т.е. точные log p(x_t|x_<t); сервер работает без speculative decoding)
--> анализ, отчёт, график.
+-> анализ по режимам, отчёт, график.
 
 Запуск:
   python3 detect.py --models-dir /path/to/gguf   # полный прогон
@@ -53,6 +54,7 @@ import requests
 import torch
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+MODES = ("reason", "noreason")  # с reasoning (thinking) / без
 
 # Репозиторий SynthID-Text как Python-модуль (сабмодуль в корне проекта)
 sys.path.insert(0, os.path.join(ROOT, "synthid-text", "src"))
@@ -99,9 +101,10 @@ class Config:
     wm_gguf: str = "Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
     base_gguf: str = "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
     # Окружение
-    llama_bin: str = "llama-server"
+    llama_bin: str = ("/home/alexey/mipt_mag_diploma-mipt_mag_diploma_private"
+                      "/llm/llama.cpp-rdna3/build/bin/llama-server")
     models_dir: str = "."
-    device: str = "cuda0"
+    device: str = "ROCm1"
     host: str = "127.0.0.1"
     port: int = 8091
     server_ctx: int = 8192
@@ -148,22 +151,64 @@ class ServerManager:
             stderr=subprocess.STDOUT, start_new_session=True)
         print(f"[server] pid={self.proc.pid}, лог: {log_path}", flush=True)
 
-    def kill(self):
-        if self.proc is None:
-            return
-        try:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            self.proc.wait(timeout=60)
-        except subprocess.TimeoutExpired:
+    def _find_port_pid(self):
+        """pid процесса, слушающего cfg.port (скан /proc)."""
+        port_hex = "%04X" % self.cfg.port
+        inodes = set()
+        for path in ("/proc/net/tcp", "/proc/net/tcp6"):
             try:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                with open(path) as f:
+                    for line in f.readlines()[1:]:
+                        parts = line.split()
+                        if len(parts) > 9:
+                            local = parts[1]
+                            if local.rsplit(":", 1)[1] == port_hex:
+                                inodes.add(parts[9])
+            except OSError:
+                continue
+        if not inodes:
+            return None
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                fds = os.listdir(f"/proc/{pid}/fd")
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    link = os.readlink(f"/proc/{pid}/fd/{fd}")
+                except OSError:
+                    continue
+                if link.startswith("socket:[") and link[8:-1] in inodes:
+                    return int(pid)
+        return None
+
+    def kill(self):
+        """Остановить сервер: наш дочерний процесс ИЛИ посторонний
+        процесс на порту (остаток предыдущего упавшего прогона)."""
+        pid = None
+        if self.proc is not None:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
-            self.proc.wait(timeout=30)
-        self.proc = None
+            pid = self.proc.pid
+            self.proc = None
+        else:
+            pid = self._find_port_pid()
+        if pid is not None:
+            for _ in range(60):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(1)
+            else:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         if self.log_fh:
             self.log_fh.close()
             self.log_fh = None
@@ -194,7 +239,11 @@ class ServerManager:
         return None
 
     def _match(self, loaded, gguf):
-        return bool(loaded) and os.path.basename(loaded) == gguf
+        if not loaded:
+            return False
+        base = os.path.basename(loaded)
+        # сервер может отдавать id с/без расширения .gguf
+        return base == gguf or base == os.path.splitext(gguf)[0]
 
     def wait_ready(self, gguf, timeout=900):
         t0 = time.time()
@@ -257,92 +306,100 @@ class Server:
         self.timeout = timeout
         self.model_id = model_id
 
-    def generate(self, prompt, max_tokens,
+    def generate(self, prompt, max_tokens, reason=True,
                  temperature=1.0, top_k=20, top_p=0.95):
-        """-> (text, token_ids). token ids нужны для SynthID-детектора
-        (G-значения); logprobs=1 — носитель для них."""
-        r = self.s.post(f"{self.base}/v1/completions", json={
+        """-> (text, token_ids). Chat-completion (chat-шаблон Qwen3):
+        reason — режим thinking (enable_thinking). token ids нужны для
+        SynthID-детектора (G-значения); logprobs=1 — носитель для них."""
+        r = self.s.post(f"{self.base}/v1/chat/completions", json={
             "model": self.model_id,
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_k": top_k,
             "top_p": top_p,
             "logprobs": 1,
+            "chat_template_kwargs": {"enable_thinking": reason},
             "stream": False,
         }, timeout=self.timeout)
         r.raise_for_status()
         ch = r.json()["choices"][0]
         ids = [int(t["id"])
                for t in (ch.get("logprobs") or {}).get("content") or []]
-        return ch.get("text", ""), ids
+        return ch.get("message", {}).get("content", ""), ids
 
     def score(self, prompt, text, n_tokens):
-        """L = Σ log p(x_t | x_<t) под текущей моделью. Текст
-        принудительно генерируется GBNF-грамматикой; logprobs сервера
-        — pre-sampling (сырой softmax по всему словарю, без влияния
-        сэмплеров). -> (L, n_scored): n_scored может незначительно
-        превышать n_tokens — грамматика ре-токенизирует текст,
-        детокенизация не обратима."""
+        """L = Σ log p(x_t | x_<t) под текущей моделью. Тот же
+        chat-completion-контекст, что и в generate (enable_thinking
+        всегда false — текст зафиксирован GBNF-грамматикой, thinking
+        блок невозможен); logprobs сервера — pre-sampling (сырой
+        softmax по всему словарю, без влияния сэмплеров).
+        -> (L, n_scored): n_scored может незначительно превышать
+        n_tokens — грамматика ре-токенизирует текст, детокенизация
+        не обратима. Первый текст-токен не входит: референс
+        (openstamp/src/llr.py) считает с labels = input_ids[:, 2:]."""
         grammar = 'root ::= "' + gbnf_escape(text) + '"'
-        r = self.s.post(f"{self.base}/v1/completions", json={
+        r = self.s.post(f"{self.base}/v1/chat/completions", json={
             "model": self.model_id,
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
             "grammar": grammar,
             "max_tokens": n_tokens + 100,  # верхняя граница; грамматика сама завершает
             "logprobs": 1,
             "temperature": 1.0,
             "top_k": 1,
+            "chat_template_kwargs": {"enable_thinking": False},
             "stream": False,
         }, timeout=self.timeout)
         r.raise_for_status()
         ch = r.json()["choices"][0]
-        gen = ch.get("text", "")
+        gen = ch.get("message", {}).get("content", "")
         if gen != text:
             raise SystemExit(f"[score] грамматика не зафиксировала текст: "
                              f"{len(gen)} vs {len(text)} символов")
         lps = (ch.get("logprobs") or {}).get("content") or []
         if len(lps) < 2:
             raise SystemExit("[score] в ответе нет logprobs")
-        # Первый текст-токен не входит: референс (openstamp/src/llr.py)
-        # считает с labels = input_ids[:, 2:]
         return sum(t["logprob"] for t in lps[1:]), len(lps)
 
 # --------------------------------------------------------------------------
 # Сбор данных
 # --------------------------------------------------------------------------
-def collect(cfg, server, prompts, max_tokens, data, tag):
+def collect(cfg, server, prompts, max_tokens, data, tag, mode):
     out = []
     t0 = time.time()
     for i, p in enumerate(prompts):
-        print(f"[collect:{tag}] {i+1}/{len(prompts)}: {p[:60]!r} ...", flush=True)
-        text, ids = server.generate(p, max_tokens)
+        reason = (mode == "reason")
+        print(f"[collect:{tag}:{mode}] {i+1}/{len(prompts)}: {p[:60]!r} ...",
+              flush=True)
+        text, ids = server.generate(p, max_tokens, reason=reason)
         out.append({"prompt": p, "text": text, "token_ids": ids, "n": len(ids)})
-        data[tag] = out
+        data.setdefault(tag, {})[mode] = out
         save_data(cfg, data)
         el = time.time() - t0
         eta = el / (i + 1) * (len(prompts) - i - 1)
-        print(f"[collect:{tag}] {i+1}/{len(prompts)}: {len(ids)} tok, "
+        print(f"[collect:{tag}:{mode}] {i+1}/{len(prompts)}: {len(ids)} tok, "
               f"прошло {el:.0f} с, ETA {eta:.0f} с", flush=True)
 
 
-def score_texts_server(cfg, server, data, tag, field):
+def score_texts_server(cfg, server, data, tag, mode, field):
     """Скоринг текстов сервером (GBNF-грамматики):
-    data[tag][i][field] = L, data[tag][i]["n_scored"] = n."""
-    todo = [i for i, r in enumerate(data[tag]) if field not in r]
+    data[tag][mode][i][field] = L, data[tag][mode][i]["n_scored"] = n."""
+    rows = data[tag][mode]
+    todo = [i for i, r in enumerate(rows) if field not in r]
     if not todo:
         return
-    print(f"[score:{field}] {len(todo)} текстов <- текущая модель", flush=True)
+    print(f"[score:{field}:{tag}:{mode}] {len(todo)} текстов <- текущая модель",
+          flush=True)
     t0 = time.time()
     for n, i in enumerate(todo):
-        rec = data[tag][i]
+        rec = rows[i]
         L, n_scored = server.score(rec["prompt"], rec["text"], rec["n"])
-        data[tag][i][field] = L
-        data[tag][i]["n_scored"] = n_scored
+        rows[i][field] = L
+        rows[i]["n_scored"] = n_scored
         save_data(cfg, data)
         el = time.time() - t0
         eta = el / (n + 1) * (len(todo) - n - 1)
-        print(f"[score:{field}] {n+1}/{len(todo)}: L={L:.3f}, "
+        print(f"[score:{field}:{tag}:{mode}] {n+1}/{len(todo)}: L={L:.3f}, "
               f"n_scored={n_scored}, прошло {el:.0f} с, ETA {eta:.0f} с",
               flush=True)
 
@@ -351,21 +408,25 @@ def score_texts_server(cfg, server, data, tag, field):
 # Детектор 1: OpenStamp (LLR)
 # --------------------------------------------------------------------------
 def openstamp_llrs(data):
-    """LLR: формула из openstamp/src/llr.py (length_normalized_llr) —
-    (Σ log p_wm − Σ log p_base) / N, N — число посчитанных токенов.
-    Референс-реализация работает с полными logits (B, T, V); здесь
-   используются по-токенные logprobs сервера (gather log_softmax по
-   позициям токенов) — эквивалентность проверяется в test_llr.py."""
-    llr_wm, llr_null = [], []
-    for i in range(len(data["wm"])):
-        n = data["wm"][i].get("n_scored", data["wm"][i]["n"])
-        llr_wm.append((data["wm"][i]["L_wm"] - data["wm"][i]["L_base"])
-                      / max(n - 1, 1))
-    for i in range(len(data["base"])):
-        n = data["base"][i].get("n_scored", data["base"][i]["n"])
-        llr_null.append((data["base"][i]["L_wm"] - data["base"][i]["L_base"])
-                        / max(n - 1, 1))
-    return np.array(llr_wm), np.array(llr_null)
+    """-> {mode: (llr_wm, llr_null)}. LLR: формула из openstamp/src/llr.py
+    (length_normalized_llr) — (Σ log p_wm − Σ log p_base) / N, N — число
+    посчитанных токенов. Референс-реализация работает с полными logits
+    (B, T, V); здесь используются по-токенные logprobs сервера (gather
+    log_softmax по позициям токенов) — эквивалентность проверяется в
+    test_llr.py."""
+    out = {}
+    for mode in MODES:
+        llr_wm, llr_null = [], []
+        for i in range(len(data["wm"][mode])):
+            n = data["wm"][mode][i].get("n_scored", data["wm"][mode][i]["n"])
+            llr_wm.append((data["wm"][mode][i]["L_wm"]
+                           - data["wm"][mode][i]["L_base"]) / max(n - 1, 1))
+        for i in range(len(data["base"][mode])):
+            n = data["base"][mode][i].get("n_scored", data["base"][mode][i]["n"])
+            llr_null.append((data["base"][mode][i]["L_wm"]
+                             - data["base"][mode][i]["L_base"]) / max(n - 1, 1))
+        out[mode] = (np.array(llr_wm), np.array(llr_null))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -410,15 +471,18 @@ class SynthIDDetector:
 
 
 def synthid_scores(cfg, data, det):
+    """-> {tag: {mode: [rows]}}: по-последовательностные G-значения."""
     out = {}
     for tag in ("wm", "base"):
-        rows = []
-        for rec in data[tag]:
-            g, z, M = det.score(rec["token_ids"])
-            rows.append({"mean_g": g, "z": z, "M": M})
-            rec["synthid"] = rows[-1]
-        out[tag] = rows
-        save_data(cfg, data)
+        out[tag] = {}
+        for mode in MODES:
+            rows = []
+            for rec in data[tag][mode]:
+                g, z, M = det.score(rec["token_ids"])
+                rows.append({"mean_g": g, "z": z, "M": M})
+                rec["synthid"] = rows[-1]
+            out[tag][mode] = rows
+            save_data(cfg, data)
     return out
 
 
@@ -449,61 +513,46 @@ def aggregate(signal, null):
 # --------------------------------------------------------------------------
 # График
 # --------------------------------------------------------------------------
-def make_plot(cfg, llr_wm, llr_null, synth, a_llr, res_path):
+def make_plot(cfg, llrs, synth, aggs, res_path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    gw = np.array([r["mean_g"] for r in synth["wm"]])
-    gb = np.array([r["mean_g"] for r in synth["base"]])
-
     fig, axes = plt.subplots(2, 2, figsize=(13, 8.5))
     fig.suptitle(f"Watermark detection: {cfg.wm_name} vs {cfg.base_name}\n"
-                 "(OpenStamp LLR + SynthID-Text G-values)", fontsize=13)
+                 "(OpenStamp LLR + SynthID-Text G-values; "
+                 "columns: reasoning on/off)", fontsize=13)
 
-    ax = axes[0][0]
-    ax.hist(llr_null, bins=12, alpha=0.55, color="tab:blue",
-            label="base texts (null)")
-    ax.hist(llr_wm, bins=12, alpha=0.55, color="tab:red",
-            label=f"{cfg.wm_name} texts (signal)")
-    ax.axvline(a_llr["tau"], color="k", ls="--", lw=1.5,
-              label=f"tau = {a_llr['tau']:.3f}")
-    ax.set_title("OpenStamp: length-normalized LLR per text")
-    ax.set_xlabel("LLR (nats/token)")
-    ax.legend()
+    for c, mode in enumerate(MODES):
+        on = "on" if mode == "reason" else "off"
+        llr_wm, llr_null = llrs[mode]
+        gw = np.array([r["mean_g"] for r in synth["wm"][mode]])
+        gb = np.array([r["mean_g"] for r in synth["base"][mode]])
 
-    ax = axes[0][1]
-    ax.hist(gb, bins=12, alpha=0.55, color="tab:blue", label="base texts (null)")
-    ax.hist(gw, bins=12, alpha=0.55, color="tab:red",
-            label=f"{cfg.wm_name} texts (signal)")
-    ax.axvline(0.5, color="k", ls="--", lw=1.5, label="null mean = 0.5")
-    ax.axvline(0.75, color="gray", ls=":", lw=1.5,
-              label="expected watermarked ~ 0.75")
-    ax.set_title("SynthID-Text: mean G-value per text (default key)")
-    ax.set_xlabel("mean G")
-    ax.legend()
+        ax = axes[0][c]
+        ax.hist(llr_null, bins=12, alpha=0.55, color="tab:blue",
+                label="base texts (null)")
+        ax.hist(llr_wm, bins=12, alpha=0.55, color="tab:red",
+                label=f"{cfg.wm_name} texts (signal)")
+        ax.axvline(aggs[mode]["tau"], color="k", ls="--", lw=1.5,
+                   label=f"tau = {aggs[mode]['tau']:.3f}")
+        ax.set_title(f"OpenStamp: length-normalized LLR per text "
+                     f"(reasoning {on})")
+        ax.set_xlabel("LLR (nats/token)")
+        ax.legend()
 
-    ax = axes[1][0]
-    xs = np.arange(len(llr_wm))
-    ax.bar(xs - 0.2, llr_null, width=0.4, color="tab:blue", alpha=0.7,
-           label="null")
-    ax.bar(xs + 0.2, llr_wm, width=0.4, color="tab:red", alpha=0.7,
-           label=cfg.wm_name)
-    ax.axhline(a_llr["tau"], color="k", ls="--", lw=1.5)
-    ax.set_title("Per-prompt LLR")
-    ax.set_xlabel("prompt index")
-    ax.set_ylabel("LLR")
-    ax.legend()
-
-    ax = axes[1][1]
-    ax.bar(xs - 0.2, gb, width=0.4, color="tab:blue", alpha=0.7, label="null")
-    ax.bar(xs + 0.2, gw, width=0.4, color="tab:red", alpha=0.7,
-           label=cfg.wm_name)
-    ax.axhline(0.5, color="k", ls="--", lw=1.5)
-    ax.axhline(0.75, color="gray", ls=":", lw=1.5)
-    ax.set_title("Per-prompt mean G-value")
-    ax.set_xlabel("prompt index")
-    ax.set_ylabel("mean G")
+        ax = axes[1][c]
+        ax.hist(gb, bins=12, alpha=0.55, color="tab:blue",
+                label="base texts (null)")
+        ax.hist(gw, bins=12, alpha=0.55, color="tab:red",
+                label=f"{cfg.wm_name} texts (signal)")
+        ax.axvline(0.5, color="k", ls="--", lw=1.5, label="null mean = 0.5")
+        ax.axvline(0.75, color="gray", ls=":", lw=1.5,
+                   label="expected watermarked ~ 0.75")
+        ax.set_title(f"SynthID-Text: mean G-value per text "
+                     f"(reasoning {on})")
+        ax.set_xlabel("mean G")
+        ax.legend()
 
     fig.tight_layout(rect=[0, 0, 1, 0.94])
     fig.savefig(res_path, dpi=150)
@@ -513,48 +562,59 @@ def make_plot(cfg, llr_wm, llr_null, synth, a_llr, res_path):
 # --------------------------------------------------------------------------
 # Отчёт
 # --------------------------------------------------------------------------
-def print_report(cfg, synth, a_llr, a_syn):
-    gw = np.array([r["mean_g"] for r in synth["wm"]])
-    gb = np.array([r["mean_g"] for r in synth["base"]])
-    zw = np.array([r["z"] for r in synth["wm"]])
+def print_report(cfg, llrs, synth, aggs_llr, aggs_syn):
     print()
     print("=" * 78)
     print("  ИТОГОВЫЙ ОТЧЁТ: детекция watermark")
     print(f"  watermarked-кандидат: {cfg.wm_name}")
     print(f"  база (null):          {cfg.base_name}")
     print("=" * 78)
+    for mode in MODES:
+        on = "on" if mode == "reason" else "off"
+        a_llr = aggs_llr[mode]
+        a_syn = aggs_syn[mode]
+        gw = np.array([r["mean_g"] for r in synth["wm"][mode]])
+        gb = np.array([r["mean_g"] for r in synth["base"][mode]])
+        zw = np.array([r["z"] for r in synth["wm"][mode]])
+        print()
+        print(f"=== reasoning: {on} ===")
+        print("[1] OpenStamp — length-normalized LLR (wm vs base)")
+        print(f"    {cfg.wm_name}-тексты : mean={a_llr['signal_mean']:+.4f}  "
+              f"median={a_llr['signal_median']:+.4f}  "
+              f"[{a_llr['signal_min']:+.4f} .. {a_llr['signal_max']:+.4f}]")
+        print(f"    null-тексты  : mean={a_llr['null_mean']:+.4f}  "
+              f"std={a_llr['null_std']:.4f}")
+        print(f"    tau (mean+3std) = {a_llr['tau']:+.4f}")
+        print(f"    {cfg.wm_name} > tau: {a_llr['hits']}/{a_llr['n']} "
+              f"({a_llr['hit_rate']*100:.1f}%)")
+        print(f"    z-сводка: {a_llr['z_agg']:+.2f}")
+        print(f"    => {'WATERMARK ОБНАРУЖЕН' if a_llr['verdict'] else 'watermark не обнаружен'}")
+        print()
+        print("[2] SynthID-Text — mean G-value (default key из репозитория)")
+        print(f"    {cfg.wm_name}-тексты : mean G={gw.mean():.4f}  "
+              f"(null 0.50, ожидаемо у watermarked ~0.75)")
+        print(f"    null-тексты  : mean G={gb.mean():.4f}")
+        print(f"    z по последовательностям: "
+              f"mean={zw.mean():+.2f}, max={zw.max():+.2f}")
+        print(f"    {cfg.wm_name} > tau: {a_syn['hits']}/{a_syn['n']} "
+              f"({a_syn['hit_rate']*100:.1f}%)")
+        print(f"    z-сводка: {a_syn['z_agg']:+.2f}")
+        print(f"    => {'WATERMARK ОБНАРУЖЕН' if a_syn['verdict'] else 'watermark не обнаружен'}")
     print()
-    print("[1] OpenStamp — length-normalized LLR (wm vs base)")
-    print(f"    {cfg.wm_name}-тексты : mean={a_llr['signal_mean']:+.4f}  "
-          f"median={a_llr['signal_median']:+.4f}  "
-          f"[{a_llr['signal_min']:+.4f} .. {a_llr['signal_max']:+.4f}]")
-    print(f"    null-тексты  : mean={a_llr['null_mean']:+.4f}  "
-          f"std={a_llr['null_std']:.4f}")
-    print(f"    tau (mean+3std) = {a_llr['tau']:+.4f}")
-    print(f"    {cfg.wm_name} > tau: {a_llr['hits']}/{a_llr['n']} "
-          f"({a_llr['hit_rate']*100:.1f}%)")
-    print(f"    z-сводка: {a_llr['z_agg']:+.2f}")
-    print(f"    => {'WATERMARK ОБНАРУЖЕН' if a_llr['verdict'] else 'watermark не обнаружен'}")
-    print()
-    print("[2] SynthID-Text — mean G-value (default key из репозитория)")
-    print(f"    {cfg.wm_name}-тексты : mean G={gw.mean():.4f}  "
-          f"(null 0.50, ожидаемо у watermarked ~0.75)")
-    print(f"    null-тексты  : mean G={gb.mean():.4f}")
-    print(f"    z по последовательностям: "
-          f"mean={zw.mean():+.2f}, max={zw.max():+.2f}")
-    print(f"    {cfg.wm_name} > tau: {a_syn['hits']}/{a_syn['n']} "
-          f"({a_syn['hit_rate']*100:.1f}%)")
-    print(f"    z-сводка: {a_syn['z_agg']:+.2f}")
-    print(f"    => {'WATERMARK ОБНАРУЖЕН' if a_syn['verdict'] else 'watermark не обнаружен'}")
-    print()
-    if a_llr["verdict"] and a_syn["verdict"]:
-        print("ИТОГО: watermark ВЫЯВЛЕН обоими детекторами.")
-    elif a_llr["verdict"] or a_syn["verdict"]:
-        print("ИТОГО: watermark выявлен одним детектором — результат "
-              "однозначным не является, нужны данные с известным ключом.")
-    else:
-        print("ИТОГО: watermark НЕ выявлен ни одним детектором "
-              "(при известном/дефолтном ключе).")
+    print("=" * 78)
+    for mode in MODES:
+        on = "on" if mode == "reason" else "off"
+        v_llr = aggs_llr[mode]["verdict"]
+        v_syn = aggs_syn[mode]["verdict"]
+        if v_llr and v_syn:
+            s = "watermark ВЫЯВЛЕН обоими детекторами"
+        elif v_llr or v_syn:
+            s = ("watermark выявлен одним детектором — результат "
+                 "однозначным не является, нужны данные с известным ключом")
+        else:
+            s = ("watermark НЕ выявлен ни одним детектором "
+                 "(при известном/дефолтном ключе)")
+        print(f"ИТОГО (reasoning {on}): {s}")
 
 
 # --------------------------------------------------------------------------
@@ -562,14 +622,15 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    # Окружение
-    ap.add_argument("--llama-bin", default="llama-server",
-                    help="бинарь llama-server (PATH или полный путь)")
+    ap.add_argument("--llama-bin",
+                    default=("/home/alexey/mipt_mag_diploma-mipt_mag_diploma_private"
+                             "/llm/llama.cpp-rdna3/build/bin/llama-server")),
     ap.add_argument("--models-dir", default=".",
                     help="каталог с GGUF-файлами")
-    ap.add_argument("--device", default="cuda0",
+    ap.add_argument("--device", default="ROCm1",
                     help="устройство сервера (llama.cpp -device)")
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="адрес сервера (llama.cpp -host)")
     ap.add_argument("--port", type=int, default=8091)
     # Модели
     ap.add_argument("--wm-model", default="Swift-1.5-Qwen3.8-27B-GSQ-RCO",
@@ -583,7 +644,7 @@ def main():
                     default="Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf",
                     help="GGUF базовой модели в models-dir")
     # Протокол
-    ap.add_argument("--prompts", type=int, default=24)
+    ap.add_argument("--prompts", type=int, default=30)
     ap.add_argument("--tokens", type=int, default=400)
     ap.add_argument("--analyze-only", action="store_true",
                     help="не собирать, только анализ по data.json")
@@ -622,11 +683,12 @@ def main():
 
     def _missing():
         for tag in ("wm", "base"):
-            if tag not in data:
-                return True
-            for r in data[tag]:
-                if "L_wm" not in r or "L_base" not in r:
+            for mode in MODES:
+                if tag not in data or mode not in data.get(tag, {}):
                     return True
+                for r in data[tag][mode]:
+                    if "L_wm" not in r or "L_base" not in r:
+                        return True
         return False
 
     if _missing():
@@ -643,53 +705,65 @@ def main():
                 raise SystemExit(f"[config] не найден GGUF: {p}")
         # Генерация и скоринг через llama-server (одна модель в VRAM за раз)
         mgr = ServerManager(cfg)
-        # Фаза 1: генерация
-        model_id = mgr.ensure_model(cfg.wm_gguf)
-        if "wm" not in data:
-            collect(cfg, Server(cfg, model_id), prompts, cfg.tokens,
-                    data, "wm")
-        model_id = mgr.ensure_model(cfg.base_gguf)
-        if "base" not in data:
-            collect(cfg, Server(cfg, model_id), prompts, cfg.tokens,
-                    data, "base")
-        # Фаза 2: скоринг под WM-моделью (L_wm)
-        model_id = mgr.ensure_model(cfg.wm_gguf)
-        srv = Server(cfg, model_id)
-        for tag in ("wm", "base"):
-            if any("L_wm" not in r for r in data[tag]):
-                score_texts_server(cfg, srv, data, tag, "L_wm")
-        # Фаза 3: скоринг под BASE-моделью (L_base)
-        model_id = mgr.ensure_model(cfg.base_gguf)
-        srv = Server(cfg, model_id)
-        for tag in ("wm", "base"):
-            if any("L_base" not in r for r in data[tag]):
-                score_texts_server(cfg, srv, data, tag, "L_base")
-        mgr.kill()
+        try:
+            # Фаза 1: генерация (wm-модель — оба режима, base-модель — оба)
+            model_id = mgr.ensure_model(cfg.wm_gguf)
+            srv = Server(cfg, model_id)
+            for mode in MODES:
+                if mode not in data.get("wm", {}):
+                    collect(cfg, srv, prompts, cfg.tokens, data, "wm", mode)
+            model_id = mgr.ensure_model(cfg.base_gguf)
+            srv = Server(cfg, model_id)
+            for mode in MODES:
+                if mode not in data.get("base", {}):
+                    collect(cfg, srv, prompts, cfg.tokens, data, "base", mode)
+            # Фаза 2: скоринг под WM-моделью (L_wm)
+            model_id = mgr.ensure_model(cfg.wm_gguf)
+            srv = Server(cfg, model_id)
+            for tag in ("wm", "base"):
+                for mode in MODES:
+                    if any("L_wm" not in r for r in data[tag][mode]):
+                        score_texts_server(cfg, srv, data, tag, mode, "L_wm")
+            # Фаза 3: скоринг под BASE-моделью (L_base)
+            model_id = mgr.ensure_model(cfg.base_gguf)
+            srv = Server(cfg, model_id)
+            for tag in ("wm", "base"):
+                for mode in MODES:
+                    if any("L_base" not in r for r in data[tag][mode]):
+                        score_texts_server(cfg, srv, data, tag, mode, "L_base")
+        finally:
+            mgr.kill()
 
     # Анализ
-    llr_wm, llr_null = openstamp_llrs(data)
+    llrs = openstamp_llrs(data)
     det = SynthIDDetector()
     synth = synthid_scores(cfg, data, det)
 
-    a_llr = aggregate(llr_wm, llr_null)
-    a_syn = aggregate(np.array([r["mean_g"] for r in synth["wm"]]),
-                      np.array([r["mean_g"] for r in synth["base"]]))
+    aggs_llr, aggs_syn = {}, {}
+    for mode in MODES:
+        llr_wm, llr_null = llrs[mode]
+        aggs_llr[mode] = aggregate(llr_wm, llr_null)
+        aggs_syn[mode] = aggregate(
+            np.array([r["mean_g"] for r in synth["wm"][mode]]),
+            np.array([r["mean_g"] for r in synth["base"][mode]]))
 
     report_name = f"report_{cfg.wm_name}.json"
     plot_name = f"watermark_report_{cfg.wm_name}.png"
-    make_plot(cfg, llr_wm, llr_null, synth, a_llr,
-              os.path.join(cfg.data, plot_name))
-    print_report(cfg, synth, a_llr, a_syn)
+    make_plot(cfg, llrs, synth, aggs_llr, os.path.join(cfg.data, plot_name))
+    print_report(cfg, llrs, synth, aggs_llr, aggs_syn)
 
+    per_seq = {mode: {
+        "llr_wm": [float(x) for x in llrs[mode][0]],
+        "llr_null": [float(x) for x in llrs[mode][1]],
+        "mean_g_wm": [r["mean_g"] for r in synth["wm"][mode]],
+        "mean_g_base": [r["mean_g"] for r in synth["base"][mode]],
+    } for mode in MODES}
     report = {
         "wm_model": cfg.wm_name,
         "base_model": cfg.base_name,
-        "openstamp_llr": a_llr,
-        "synthid": a_syn,
-        "per_sequence_llr_wm": [float(x) for x in llr_wm],
-        "per_sequence_llr_null": [float(x) for x in llr_null],
-        "per_sequence_mean_g_wm": [r["mean_g"] for r in synth["wm"]],
-        "per_sequence_mean_g_base": [r["mean_g"] for r in synth["base"]],
+        "modes": {m: {"openstamp_llr": aggs_llr[m], "synthid": aggs_syn[m]}
+                  for m in MODES},
+        "per_sequence": per_seq,
         "plot": plot_name,
     }
     with open(os.path.join(cfg.data, report_name), "w") as f:
