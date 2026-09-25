@@ -416,16 +416,13 @@ def openstamp_llrs(data):
     test_llr.py."""
     out = {}
     for mode in MODES:
-        llr_wm, llr_null = [], []
-        for i in range(len(data["wm"][mode])):
-            n = data["wm"][mode][i].get("n_scored", data["wm"][mode][i]["n"])
-            llr_wm.append((data["wm"][mode][i]["L_wm"]
-                           - data["wm"][mode][i]["L_base"]) / max(n - 1, 1))
-        for i in range(len(data["base"][mode])):
-            n = data["base"][mode][i].get("n_scored", data["base"][mode][i]["n"])
-            llr_null.append((data["base"][mode][i]["L_wm"]
-                             - data["base"][mode][i]["L_base"]) / max(n - 1, 1))
-        out[mode] = (np.array(llr_wm), np.array(llr_null))
+        vals = {}
+        for tag in ("wm", "base"):
+            vals[tag] = np.array([
+                (rec["L_wm"] - rec["L_base"])
+                / max(rec.get("n_scored", rec["n"]) - 1, 1)
+                for rec in data[tag][mode]])
+        out[mode] = (vals["wm"], vals["base"])
     return out
 
 
@@ -622,30 +619,27 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--llama-bin",
-                    default=("/home/alexey/mipt_mag_diploma-mipt_mag_diploma_private"
-                             "/llm/llama.cpp-rdna3/build/bin/llama-server")),
-    ap.add_argument("--models-dir", default=".",
+    # Дефолты — из Config (единый источник)
+    ap.add_argument("--llama-bin", default=Config.llama_bin)
+    ap.add_argument("--models-dir", default=Config.models_dir,
                     help="каталог с GGUF-файлами")
-    ap.add_argument("--device", default="ROCm1",
+    ap.add_argument("--device", default=Config.device,
                     help="устройство сервера (llama.cpp -device)")
-    ap.add_argument("--host", default="127.0.0.1",
+    ap.add_argument("--host", default=Config.host,
                     help="адрес сервера (llama.cpp -host)")
-    ap.add_argument("--port", type=int, default=8091)
+    ap.add_argument("--port", type=int, default=Config.port)
     # Модели
-    ap.add_argument("--wm-model", default="Swift-1.5-Qwen3.8-27B-GSQ-RCO",
+    ap.add_argument("--wm-model", default=Config.wm_name,
                     help="имя watermarked-модели (в отчёте)")
-    ap.add_argument("--base-model", default="Qwen3.8-27B-GSQ-RCO",
+    ap.add_argument("--base-model", default=Config.base_name,
                     help="имя базовой модели (в отчёте)")
-    ap.add_argument("--wm-gguf",
-                    default="Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf",
+    ap.add_argument("--wm-gguf", default=Config.wm_gguf,
                     help="GGUF watermarked-модели в models-dir")
-    ap.add_argument("--base-gguf",
-                    default="Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf",
+    ap.add_argument("--base-gguf", default=Config.base_gguf,
                     help="GGUF базовой модели в models-dir")
     # Протокол
-    ap.add_argument("--prompts", type=int, default=30)
-    ap.add_argument("--tokens", type=int, default=400)
+    ap.add_argument("--prompts", type=int, default=Config.prompts)
+    ap.add_argument("--tokens", type=int, default=Config.tokens)
     ap.add_argument("--analyze-only", action="store_true",
                     help="не собирать, только анализ по data.json")
     ap.add_argument("--resume", action="store_true",
