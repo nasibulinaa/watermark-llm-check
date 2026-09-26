@@ -421,18 +421,25 @@ def score_texts_server(cfg, server, data, tag, mode, field):
 # --------------------------------------------------------------------------
 def openstamp_llrs(data):
     """-> {mode: (llr_wm, llr_null)}: (L_wm − L_base) / (n_scored − 1).
-    Эквивалентность референсу openstamp/src/llr.py — test_llr.py."""
+    Пары по индексу промпта: строка учитывается, если тексты обеих
+    моделей валидны (непустые и посчитаны). Эквивалентность
+    референсу openstamp/src/llr.py — test_llr.py."""
     out = {}
     for mode in MODES:
-        vals = {}
-        for tag in ("wm", "base"):
-            vals[tag] = np.array([
-                (rec["L_wm"] - rec["L_base"])
-                / max(rec.get("n_scored", rec["n"]) - 1, 1)
-                for rec in data[tag][mode]
-                if rec.get("text", "").strip()
-                and "L_wm" in rec and "L_base" in rec])
-        out[mode] = (vals["wm"], vals["base"])
+        wm_recs, base_recs = data["wm"][mode], data["base"][mode]
+        llr_wm, llr_null = [], []
+        for i in range(min(len(wm_recs), len(base_recs))):
+            a, b = wm_recs[i], base_recs[i]
+            ok = (a.get("text", "").strip() and b.get("text", "").strip()
+                  and all(k in r for r, k in ((a, "L_wm"), (a, "L_base"),
+                                             (b, "L_wm"), (b, "L_base"))))
+            if not ok:
+                continue
+            llr_wm.append((a["L_wm"] - a["L_base"])
+                          / max(a.get("n_scored", a["n"]) - 1, 1))
+            llr_null.append((b["L_wm"] - b["L_base"])
+                            / max(b.get("n_scored", b["n"]) - 1, 1))
+        out[mode] = (np.array(llr_wm), np.array(llr_null))
     return out
 
 
@@ -479,19 +486,24 @@ class SynthIDDetector:
 
 
 def synthid_scores(cfg, data, det):
-    """-> {tag: {mode: [rows]}}: по-последовательностные G-значения."""
-    out = {}
-    for tag in ("wm", "base"):
-        out[tag] = {}
-        for mode in MODES:
-            rows = []
-            for rec in data[tag][mode]:
-                if not rec.get("text", "").strip():
-                    continue
-                g, z, M = det.score(rec["token_ids"])
-                rows.append({"mean_g": g, "z": z, "M": M})
-            out[tag][mode] = rows
-            save_data(cfg, data)
+    """-> {tag: {mode: [rows]}}: по-последовательностные G-значения.
+    Строки выравнены по индексу промпта: учитываются пары, где тексты
+    обеих моделей непустые (signal и null — спаренные)."""
+    out = {"wm": {}, "base": {}}
+    for mode in MODES:
+        wm_recs, base_recs = data["wm"][mode], data["base"][mode]
+        wm_rows, base_rows = [], []
+        for i in range(min(len(wm_recs), len(base_recs))):
+            a, b = wm_recs[i], base_recs[i]
+            if not (a.get("text", "").strip() and b.get("text", "").strip()):
+                continue
+            g, z, M = det.score(a["token_ids"])
+            wm_rows.append({"mean_g": g, "z": z, "M": M})
+            g, z, M = det.score(b["token_ids"])
+            base_rows.append({"mean_g": g, "z": z, "M": M})
+        out["wm"][mode] = wm_rows
+        out["base"][mode] = base_rows
+        save_data(cfg, data)
     return out
 
 
@@ -499,7 +511,21 @@ def synthid_scores(cfg, data, det):
 # Статистика и вердикт
 # --------------------------------------------------------------------------
 def aggregate(signal, null):
-    """Сводка по signal/null: tau = mean+3std; verdict = (hits >= 75% n) и z_agg >= 3."""
+    """Сводка по signal/null (пары по промптам).
+
+    Основной статистика — спаренный t-критерий по разностям
+    d = signal - null (одни и те же промпты у обеих моделей):
+    t_agg = mean(d) / (std(d)/sqrt(n)). Он не зависит от маргинальной
+    дисперсии null (та, что надувала tau при малом n).
+    verdict = (t_agg >= 3.0) и (большинство d > 0).
+    tau/hits — по-текстовый взгляд (auxiliary), z_agg — неспаренный аналог.
+    """
+    signal = np.asarray(signal, dtype=float)
+    null = np.asarray(null, dtype=float)
+    d = signal - null
+    sd = float(d.std(ddof=1))
+    t_agg = float(d.mean() / (sd / math.sqrt(len(d)))) if sd > 0 else 0.0
+    pos_rate = float((d > 0).mean())
     tau = float(null.mean() + 3 * null.std())
     hits = int((signal > tau).sum())
     z_agg = float((signal.mean() - null.mean())
@@ -516,7 +542,9 @@ def aggregate(signal, null):
         "n": int(len(signal)),
         "hit_rate": hits / len(signal),
         "z_agg": z_agg,
-        "verdict": (hits >= 0.75 * len(signal)) and (z_agg >= 3.0),
+        "t_agg": t_agg,
+        "pos_rate": pos_rate,
+        "verdict": (t_agg >= 3.0) and (pos_rate >= 0.5),
     }
 
 
@@ -599,7 +627,8 @@ def print_report(cfg, llrs, synth, aggs_llr, aggs_syn):
         print(f"    tau (mean+3std) = {a_llr['tau']:+.4f}")
         print(f"    {cfg.wm_name} > tau: {a_llr['hits']}/{a_llr['n']} "
               f"({a_llr['hit_rate']*100:.1f}%)")
-        print(f"    z-сводка: {a_llr['z_agg']:+.2f}")
+        print(f"    t-сводка (спаренный): {a_llr['t_agg']:+.2f}   "
+              f"z-сводка: {a_llr['z_agg']:+.2f}")
         print(f"    => {'WATERMARK ОБНАРУЖЕН' if a_llr['verdict'] else 'watermark не обнаружен'}")
         print()
         print("[2] SynthID-Text — mean G-value (default key из репозитория)")
@@ -610,7 +639,8 @@ def print_report(cfg, llrs, synth, aggs_llr, aggs_syn):
               f"mean={zw.mean():+.2f}, max={zw.max():+.2f}")
         print(f"    {cfg.wm_name} > tau: {a_syn['hits']}/{a_syn['n']} "
               f"({a_syn['hit_rate']*100:.1f}%)")
-        print(f"    z-сводка: {a_syn['z_agg']:+.2f}")
+        print(f"    t-сводка (спаренный): {a_syn['t_agg']:+.2f}   "
+              f"z-сводка: {a_syn['z_agg']:+.2f}")
         print(f"    => {'WATERMARK ОБНАРУЖЕН' if a_syn['verdict'] else 'watermark не обнаружен'}")
     print()
     print("=" * 78)
@@ -644,6 +674,8 @@ def main():
     ap.add_argument("--host", default=Config.host,
                     help="адрес сервера (llama.cpp -host)")
     ap.add_argument("--port", type=int, default=Config.port)
+    ap.add_argument("--data", default=Config.data,
+                    help="каталог data.json/отчёта/графика (по прогонам)")
     # Модели
     ap.add_argument("--wm-model", default=Config.wm_name,
                     help="имя watermarked-модели (в отчёте)")
@@ -673,6 +705,7 @@ def main():
         device=args.device,
         host=args.host,
         port=args.port,
+        data=args.data,
         prompts=args.prompts,
         tokens=args.tokens,
     )

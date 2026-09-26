@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """Статус прогона детекции watermark.
 
-Читает data/data.json (сохраняется после каждого промпта) и показывает:
-- сколько текстов собрано по каждому (модель, режим)
+Без аргументов — показывает все прогоны (data/data.json и data-*/data.json).
+С аргументом — один файл: python3 status.py /путь/к/data.json
+
+Показывает по каждому (модель, режим):
+- сколько текстов собрано
 - сколько токенов
 - сколько текстов уже посчитано под L_wm / L_base
 - пустые тексты (модель зациклилась на спец-токенах) не скорятся —
   в знаменателе число непустых
 - mtime файла
-
-Запуск: python3 status.py [путь к data.json]
 """
+import glob
 import json
 import os
 import sys
 import time
 
 
-def main():
-    root = os.path.dirname(os.path.abspath(__file__))
-    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "data", "data.json")
+def show(path):
     if not os.path.isfile(path):
         print(f"нет файла: {path} (прогон ещё не начал писать данные)")
         return
@@ -28,7 +28,7 @@ def main():
         with open(path) as f:
             data = json.load(f)
     except json.JSONDecodeError:
-        print("data.json читается в момент записи — повторите через пару секунд")
+        print(f"{path}: читается в момент записи — повторите через пару секунд")
         return
 
     st = os.stat(path)
@@ -67,6 +67,23 @@ def main():
 
     print()
     print(f"итого: {total} текстов собрано, {done} полностью посчитаны")
+
+
+def main():
+    root = os.path.dirname(os.path.abspath(__file__))
+    if len(sys.argv) > 1:
+        paths = [sys.argv[1]]
+    else:
+        paths = [p for p in sorted(glob.glob(os.path.join(root, "data*", "data.json")))
+                 if os.path.isfile(p)]
+        if not paths:
+            print("data.json не найдены (прогоны не запущены)")
+            return
+    for i, path in enumerate(paths):
+        if i > 0:
+            print()
+            print("=" * 60)
+        show(path)
 
 
 if __name__ == "__main__":
