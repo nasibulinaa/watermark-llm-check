@@ -7,13 +7,12 @@
 - сколько текстов уже посчитано под L_wm / L_base
 - пустые тексты (модель зациклилась на спец-токенах) не скорятся —
   в знаменателе число непустых
-- mtime файла и текущий llama-server
+- mtime файла
 
 Запуск: python3 status.py [путь к data.json]
 """
 import json
 import os
-import subprocess
 import sys
 import time
 
@@ -68,23 +67,6 @@ def main():
 
     print()
     print(f"итого: {total} текстов собрано, {done} полностью посчитаны")
-    # Текущий llama-server
-    try:
-        out = subprocess.run(
-            ["ps", "aux"], capture_output=True, text=True, timeout=10).stdout
-        lines = [l for l in out.splitlines()
-                 if "llama-server" in l and "grep" not in l]
-        if lines:
-            print()
-            for l in lines:
-                p = l.split()
-                model = [a for a in p if a.endswith(".gguf")]
-                print(f"сервер: pid {p[1]}, {model[0].rsplit('/', 1)[-1] if model else '?'}")
-        else:
-            print()
-            print("сервер: не запущен")
-    except (subprocess.SubprocessError, OSError):
-        pass
 
 
 if __name__ == "__main__":

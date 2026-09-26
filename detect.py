@@ -1,41 +1,27 @@
 #!/usr/bin/env python3
 r"""
-Утилита детекции watermark в выводе LLM.
+Утилита детекции watermark в выводе LLM: сравнивает watermarked-кандидата
+и базовую модель (обе — llama-server, одна модель в VRAM за раз).
 
-Сравнивает две модели, сервируемые через llama.cpp: watermarked-кандидат
-и базовая модель для нулевой гипотезы. Два независимых детектора, по
-публичным референс-реализациям (оба — git-сабмодули этого проекта):
+Два детектора по публичным референс-реализациям (git-сабмодули):
 
-1) OpenStamp (openstamp/METHOD.md) — length-normalized log-likelihood
-   ratio между watermarked и базовой моделями:
+1) OpenStamp — length-normalized log-likelihood ratio между моделями,
+   ключ не нужен:
 
        $LLR(x) = \frac{1}{T-1}\sum_{t=1}^{T-1}\log\frac{p_{\text{wm}}(x_t \mid x_{<t})}{p_{\text{base}}(x_t \mid x_{<t})}$
 
-   Референс-реализация формулы: openstamp/src/llr.py
-   (length_normalized_llr); эквивалентность по-токенной версии
-   проверяется в test_llr.py.
-   Ключ не нужен. Порог τ калибруется эмпирически на непомеченном
-   (null) тексте (METHOD.md: "Thresholds are therefore calibrated
-   empirically").
+   Референс: openstamp/src/llr.py (эквивалентность — test_llr.py).
+   Порог τ калибруется по null-текстам: mean + 3std.
 
-2) SynthID-Text — G-значения: keyed-hash по (ngram_len-1)-контексту и
-   кандидат-токену, бинарные G на каждой глубине, training-free
-   weighted-mean детектор. Нулевое среднее G = 0.5 (Bernoulli-биты);
-   у watermarked-текста смещается вверх (~0.75). Используется
-   DEFAULT_WATERMARKING_CONFIG из репозитория (ngram_len=5, 30 ключей,
-   context_history_size=1024).
+2) SynthID-Text — keyed-hash G-значения (DEFAULT_WATERMARKING_CONFIG:
+   ngram_len=5, 30 ключей, context_history_size=1024). Null-среднее
+   G = 0.5 (Bernoulli-биты); у watermarked-текста смещается вверх
+   (~0.75).
 
-Фазы: генерация WM-текстов -> генерация base-текстов (оба режима:
-с reasoning и без, Qwen3 enable_thinking) -> скоринг полной
-2x2-матрицы L-значений самим llama-server (текст принудительно
-генерируется через GBNF-грамматику; logprobs сервера — pre-sampling,
-т.е. точные log p(x_t|x_<t); сервер работает без speculative decoding)
--> анализ по режимам, отчёт, график.
+Прогон: генерация (reasoning on/off) -> скоринг L под обеими моделями
+(GBNF-грамматики, pre-sampling logprobs) -> анализ, отчёт, график.
 
-Запуск:
-  python3 detect.py --models-dir /path/to/gguf   # полный прогон
-  python3 detect.py --resume                     # доскорить L
-  python3 detect.py --analyze-only               # только анализ + график
+Запуск: python3 detect.py --models-dir /path/to/gguf [--resume | --analyze-only]
 """
 
 import argparse
@@ -101,8 +87,7 @@ class Config:
     wm_gguf: str = "Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
     base_gguf: str = "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
     # Окружение
-    llama_bin: str = ("/home/alexey/mipt_mag_diploma-mipt_mag_diploma_private"
-                      "/llm/llama.cpp/build_cuda/bin/llama-server")
+    llama_bin: str = "llama-server"  # в PATH; переопределить --llama-bin
     models_dir: str = "."
     device: str = "cuda0"
     host: str = "127.0.0.1"
@@ -341,15 +326,10 @@ class Server:
         return ch.get("message", {}).get("content", ""), ids
 
     def score(self, prompt, text, n_tokens):
-        """L = Σ log p(x_t | x_<t) под текущей моделью. Тот же
-        chat-completion-контекст, что и в generate (enable_thinking
-        всегда false — текст зафиксирован GBNF-грамматикой, thinking
-        блок невозможен); logprobs сервера — pre-sampling (сырой
-        softmax по всему словарю, без влияния сэмплеров).
-        -> (L, n_scored): n_scored может незначительно превышать
-        n_tokens — грамматика ре-токенизирует текст, детокенизация
-        не обратима. Первый текст-токен не входит: референс
-        (openstamp/src/llr.py) считает с labels = input_ids[:, 2:]."""
+        """L = Σ log p(x_t|x_<t) под текущей моделью (pre-sampling
+        logprobs, enable_thinking=false, текст зафиксирован GBNF).
+        -> (L, n_scored); n_scored может слегка превышать n_tokens
+        (ре-токенизация). Первый текст-токен не входит (labels = ids[2:])."""
         if not text:
             raise SystemExit("[score] пустой текст — строка исключена из "
                              "скоринга (см. score_texts_server)")
@@ -359,10 +339,8 @@ class Server:
             "messages": [{"role": "user", "content": prompt}],
             "grammar": grammar,
             "max_tokens": n_tokens + 1000,
-            # верхняя граница с запасом: ре-токенизация текста может
-            # добавить ~15% токенов (наблюдаемо +149 к 973); после
-            # завершения грамматики сервер продолжает свободную
-            # генерацию до max_tokens (лишние токены в ответ не входят)
+            # запас на ре-токенизацию; после грамматики сервер
+            # догенерит до max_tokens — хвост в ответ не входит
             "logprobs": True, "top_logprobs": 1,
             "temperature": 1.0,
             "top_k": 1,
@@ -373,11 +351,8 @@ class Server:
         ch = r.json()["choices"][0]
         gen = ch.get("message", {}).get("content", "")
         if gen != text:
-            # Round-trip tok(text)→detok не обратим: грамматика
-            # фиксирует токен-последовательность текста, а детокенизация
-            # может терять/добавлять немного символов (границы
-            # токенов). Принимаем почти-равный текст в обоих
-            # направлениях; свободная генерация расходится сразу.
+            # detok не обратим: допускаем потерю/добавление
+            # нескольких символов на границах токенов
             ok = (text.startswith(gen) or gen.startswith(text)) \
                  and abs(len(gen) - len(text)) <= max(10, len(text) // 10)
             if not ok:
@@ -445,12 +420,8 @@ def score_texts_server(cfg, server, data, tag, mode, field):
 # Детектор 1: OpenStamp (LLR)
 # --------------------------------------------------------------------------
 def openstamp_llrs(data):
-    """-> {mode: (llr_wm, llr_null)}. LLR: формула из openstamp/src/llr.py
-    (length_normalized_llr) — (Σ log p_wm − Σ log p_base) / N, N — число
-    посчитанных токенов. Референс-реализация работает с полными logits
-    (B, T, V); здесь используются по-токенные logprobs сервера (gather
-    log_softmax по позициям токенов) — эквивалентность проверяется в
-    test_llr.py."""
+    """-> {mode: (llr_wm, llr_null)}: (L_wm − L_base) / (n_scored − 1).
+    Эквивалентность референсу openstamp/src/llr.py — test_llr.py."""
     out = {}
     for mode in MODES:
         vals = {}
@@ -519,7 +490,6 @@ def synthid_scores(cfg, data, det):
                     continue
                 g, z, M = det.score(rec["token_ids"])
                 rows.append({"mean_g": g, "z": z, "M": M})
-                rec["synthid"] = rows[-1]
             out[tag][mode] = rows
             save_data(cfg, data)
     return out
@@ -764,20 +734,18 @@ def main():
                 if have < len(prompts):
                     collect(cfg, srv, prompts, cfg.tokens, data, "base",
                             mode, start=have)
-            # Фаза 2: скоринг под WM-моделью (L_wm)
+            # Скоринг: L_wm под WM-моделью, L_base под BASE-моделью
+            # (score_texts_server сам пропускает готовые строки)
             model_id = mgr.ensure_model(cfg.wm_gguf)
             srv = Server(cfg, model_id)
             for tag in ("wm", "base"):
                 for mode in MODES:
-                    if any("L_wm" not in r for r in data[tag][mode]):
-                        score_texts_server(cfg, srv, data, tag, mode, "L_wm")
-            # Фаза 3: скоринг под BASE-моделью (L_base)
+                    score_texts_server(cfg, srv, data, tag, mode, "L_wm")
             model_id = mgr.ensure_model(cfg.base_gguf)
             srv = Server(cfg, model_id)
             for tag in ("wm", "base"):
                 for mode in MODES:
-                    if any("L_base" not in r for r in data[tag][mode]):
-                        score_texts_server(cfg, srv, data, tag, mode, "L_base")
+                    score_texts_server(cfg, srv, data, tag, mode, "L_base")
         finally:
             mgr.kill()
 
