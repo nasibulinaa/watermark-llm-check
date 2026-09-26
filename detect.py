@@ -28,6 +28,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -86,6 +87,7 @@ class Config:
     base_name: str = "Qwen3.8-27B-GSQ-RCO"
     wm_gguf: str = "Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
     base_gguf: str = "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
+    quant: str = ""  # квантизация в именах отчётов; "" — вывести из wm_gguf
     # Окружение
     llama_bin: str = "llama-server"  # в PATH; переопределить --llama-bin
     models_dir: str = "."
@@ -100,10 +102,24 @@ class Config:
     data: str = os.path.join(ROOT, "data")
 
 
+def derive_quant(gguf_name):
+    """Квантизация из имени GGUF (Q8_0, IQ3_S, Q4_K_M, F16...); "" если нет."""
+    stem = os.path.splitext(os.path.basename(gguf_name))[0]
+    for tok in reversed(stem.split("-")):
+        if re.fullmatch(r"(?:[QIT]Q?|IQ|F|BF)\d+(?:_\d+)?(?:_[A-Z]+)*", tok):
+            return tok
+    return ""
+
+
+def quant_suffix(quant):
+    """Суффикс _<квант> для имён файлов; "" если квант не задан."""
+    return f"_{quant}" if quant else ""
+
+
 def save_data(cfg, data):
-    """Сохранить data.json (вызывается после каждого промпта/текста)."""
+    """Сохранить data_<модель>_<квант>.json (после каждого промпта/текста)."""
     os.makedirs(cfg.data, exist_ok=True)
-    path = os.path.join(cfg.data, "data.json")
+    path = os.path.join(cfg.data, f"data_{cfg.wm_name}{quant_suffix(cfg.quant)}.json")
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
@@ -675,7 +691,7 @@ def main():
                     help="адрес сервера (llama.cpp -host)")
     ap.add_argument("--port", type=int, default=Config.port)
     ap.add_argument("--data", default=Config.data,
-                    help="каталог data.json/отчёта/графика (по прогонам)")
+                    help="каталог data_<модель>_<квант>.json/отчёта/графика")
     # Модели
     ap.add_argument("--wm-model", default=Config.wm_name,
                     help="имя watermarked-модели (в отчёте)")
@@ -685,13 +701,16 @@ def main():
                     help="GGUF watermarked-модели в models-dir")
     ap.add_argument("--base-gguf", default=Config.base_gguf,
                     help="GGUF базовой модели в models-dir")
+    ap.add_argument("--quant", default=Config.quant,
+                    help="квантизация в именах отчётов "
+                         "(по умолчанию — из имени wm-GGUF)")
     # Протокол
     ap.add_argument("--prompts", type=int, default=Config.prompts)
     ap.add_argument("--tokens", type=int, default=Config.tokens)
     ap.add_argument("--analyze-only", action="store_true",
-                    help="не собирать, только анализ по data.json")
+                    help="не собирать, только анализ по data-файлу")
     ap.add_argument("--resume", action="store_true",
-                    help="использовать существующий data.json, "
+                    help="использовать существующий data-файл, "
                          "доскорить только недостающие поля L")
     args = ap.parse_args()
 
@@ -700,6 +719,7 @@ def main():
         base_name=args.base_model,
         wm_gguf=args.wm_gguf,
         base_gguf=args.base_gguf,
+        quant=args.quant or derive_quant(args.wm_gguf),
         llama_bin=args.llama_bin,
         models_dir=args.models_dir,
         device=args.device,
@@ -710,7 +730,8 @@ def main():
         tokens=args.tokens,
     )
 
-    data_path = os.path.join(cfg.data, "data.json")
+    data_path = os.path.join(cfg.data,
+                             f"data_{cfg.wm_name}{quant_suffix(cfg.quant)}.json")
     prompts = PROMPTS[:cfg.prompts]
 
     data = {}
@@ -734,7 +755,7 @@ def main():
         return False
 
     if _missing() and args.analyze_only:
-        raise SystemExit("[analyze-only] data.json не полон (нет полей L) — "
+        raise SystemExit("[analyze-only] data-файл не полон (нет полей L) — "
                          "запустите полный прогон или --resume")
 
     if _missing():
@@ -801,8 +822,9 @@ def main():
         print(f"[report] исключено текстов с пустым выходом "
               f"(зацикливание на спец-токенах): {n_empty}")
 
-    report_name = f"report_{cfg.wm_name}.json"
-    plot_name = f"watermark_report_{cfg.wm_name}.png"
+    q = quant_suffix(cfg.quant)
+    report_name = f"report_{cfg.wm_name}{q}.json"
+    plot_name = f"watermark_report_{cfg.wm_name}{q}.png"
     make_plot(cfg, llrs, synth, aggs_llr, os.path.join(cfg.data, plot_name))
     print_report(cfg, llrs, synth, aggs_llr, aggs_syn)
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Статус прогона детекции watermark.
 
-Без аргументов — показывает все прогоны (data/data.json и data-*/data.json).
-С аргументом — один файл: python3 status.py /путь/к/data.json
+Без аргументов — показывает все прогоны (data*/data_*.json).
+С аргументом — один файл: python3 status.py /путь/к/data_<модель>_<квант>.json
 
 Показывает по каждому (модель, режим):
 - сколько текстов собрано
@@ -74,10 +74,10 @@ def main():
     if len(sys.argv) > 1:
         paths = [sys.argv[1]]
     else:
-        paths = [p for p in sorted(glob.glob(os.path.join(root, "data*", "data.json")))
+        paths = [p for p in sorted(glob.glob(os.path.join(root, "data*", "data*.json")))
                  if os.path.isfile(p)]
         if not paths:
-            print("data.json не найдены (прогоны не запущены)")
+            print("data-файлы не найдены (прогоны не запущены)")
             return
     for i, path in enumerate(paths):
         if i > 0:
