@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 
 # результаты прогонов
-data*/
+data*/*
 !data*/report_*.json
 !data*/watermark_report_*.png
 
