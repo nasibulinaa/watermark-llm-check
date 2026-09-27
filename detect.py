@@ -77,6 +77,36 @@ PROMPTS = [
     "Напиши функцию на Python, которая находит пересечение двух отсортированных списков за O(n).",
     "Объясни, как устроена хеш-таблица. Приведи пример реализации на Python.",
     "Напиши SQL-запрос: топ-3 товара по продажам за каждый месяц. Объясни оконные функции.",
+    "Explain the difference between a process and a thread in operating systems.",
+    "Write a regular expression to validate an email address. Explain each part.",
+    "What is the CAP theorem? Give practical examples.",
+    "Describe the water cycle in one paragraph.",
+    "Write a haiku about autumn.",
+    "Explain how RSA encryption works in simple terms.",
+    "What were the causes and consequences of the Industrial Revolution?",
+    "Write a Python script that reads a CSV file and computes column averages.",
+    "Explain the difference between accuracy and precision in measurements.",
+    "Describe how a Wi-Fi router works.",
+    "Write a JavaScript function that debounces another function. Explain usage.",
+    "What is the difference between a stack and a queue? Give examples.",
+    "Explain the concept of a blockchain in one paragraph.",
+    "Write a short essay about the importance of sleep.",
+    "Describe the mechanism of natural selection.",
+    "Объясни, чем отличается процесс от потока в операционной системе.",
+    "Напиши SQL-запрос: средняя зарплата по отделам. Используй GROUP BY.",
+    "Опиши, как работает радар автомобиля, в одном абзаце.",
+    "Напиши рассказ о человеке, который нашёл в старом шкафу письмо 1945 года.",
+    "Что такое дефляция? Приведи примеры из истории.",
+    "Объясни принцип работы Wi-Fi простыми словами.",
+    "Напиши функцию на Python для сортировки списка слов по длине.",
+    "Опиши строение атома: из чего состоит ядро и где находятся электроны.",
+    "Напиши стихотворение о дороге в горы.",
+    "В чём разница между верой и знанием? Ответь в двух абзацах.",
+    "Опиши, как устроена банковская карта: от пластика до платёжной системы.",
+    "Напиши SQL-запрос: пользователи, не делавшие покупок за последние 90 дней.",
+    "Объясни, что такое deadlock в программировании и как его избежать.",
+    "Расскажи, как работает микроволновая печь.",
+    "Напиши диалог между программистом и котом, который портит код.",
 ]
 
 
@@ -97,7 +127,7 @@ class Config:
     server_ctx: int = 8192
     server_batch: int = 2048
     # Протокол
-    prompts: int = 30
+    prompts: int = 60
     tokens: int = 400
     data: str = os.path.join(ROOT, "data")
 
