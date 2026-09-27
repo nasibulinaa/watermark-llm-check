@@ -76,10 +76,16 @@ python3 status.py                                      # статус прого
 |---|---|---|---|---|---|---|
 | [`report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.json`](data/report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.json) | Swift-1.5-Qwen3.8-27B-GSQ-RCO | Qwen3.8-27B-GSQ-RCO | IQ3_S | t = −0.34 / +1.66 (reason / noreason) | t = −1.06 / +1.07 | **watermark не обнаружен** |
 | [`report_qwen2.5-7b-openstamp-L251_Q8_0.json`](data/report_qwen2.5-7b-openstamp-L251_Q8_0.json) | qwen2.5-7b-openstamp-L251 | Qwen2.5-7B | Q8_0 | t = +6.46 / +3.37, 10/10 положительных разностей | t = −0.59 / −0.23 | **watermark обнаружен** (OpenStamp) |
+| [`report_Swift-Qwen3.8-27B-RCO_IQ3_S.json`](data/report_Swift-Qwen3.8-27B-RCO_IQ3_S.json) | Swift-Qwen3.8-27B-RCO | Qwen3.8-27B-GSQ-RCO | IQ3_S | t = +1.14 / +5.29, noreason: 25/30 положительных | t = −1.25 / −1.06 | **watermark обнаружен** (OpenStamp, только reasoning off) |
 
-- **27B-прогон** (30 промптов × 2 режима, 400 токенов): ни один детектор
+- **27B-прогон GSQ** (30 промптов × 2 режима, 400 токенов): ни один детектор
   вердикт не выдал — LLR и G-значения Swift-1.5 и Qwen3.8-27B
   неотличимы (G ≈ 0.50 с обеих сторон, смещения выше бернулли-нуля нет).
+- **27B-прогон RCO** (30 промптов × 2 режима, 400 токенов; исключено 11
+  текстов с пустым выходом): OpenStamp в режиме reasoning off
+  даёт устойчивый положительный сдвиг (t = +5.29, 25/30 текстов
+  выше null-среднего), в reasoning on — нет (t = +1.14). SynthID
+  не реагирует в обоих режимах (G ≈ 0.50, t < 1.3).
 - **7B-прогон** (10 промптов × 2 режима) — позитивный контроль: модель
   явно watermarked OpenStamp (delta=1.0, L=251). LLR-детектор её
   обнаружил в обоих режимах; SynthID (дефолтный ключ) — нет
