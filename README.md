@@ -96,7 +96,7 @@ python3 status.py                                      # статус прого
 
 | Прогон | wm (кандидат) | base | Квант | OpenStamp (LLR) | SynthID (G) | GaussMark | MarkLLM E2E (P) | Вердикт |
 |---|---|---|---|---|---|---|---|---|
-| [`report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.json`](data/report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.json) | Swift-1.5-Qwen3.8-27B-GSQ-RCO | Qwen3.8-27B-GSQ-RCO | IQ3_S | −0.34 / +1.66 | −1.06 / +1.07 | −0.34 / +1.66 | +1.14 / −1.03 | **watermark не обнаружен** |
+| [`report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.json`](data/report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.json) | Swift-1.5-Qwen3.8-27B-GSQ-RCO | Qwen3.8-27B-GSQ-RCO | IQ3_S | +0.28 / +2.89 (n = 38/60) | −0.91 / +1.59 | +0.28 / +2.89 | +2.28 / −1.08 | **watermark не обнаружен** |
 | [`report_qwen2.5-7b-openstamp-L251_Q8_0.json`](data/report_qwen2.5-7b-openstamp-L251_Q8_0.json) | qwen2.5-7b-openstamp-L251 | Qwen2.5-7B | Q8_0 | +13.72 / +9.80 (n = 60) | −0.62 / +0.51 | +13.72 / +9.80 (p<0.05: 50/60, 15/60) | −0.01 / +0.19 | **watermark обнаружен** (OpenStamp + GaussMark) |
 | [`report_Swift-Qwen3.8-27B-RCO_IQ3_S.json`](data/report_Swift-Qwen3.8-27B-RCO_IQ3_S.json) | Swift-Qwen3.8-27B-RCO | Qwen3.8-27B-GSQ-RCO | IQ3_S | +2.88 / +3.56 | −0.71 / +0.43 | +2.88 / +3.56 | −0.71 / −0.61 | **watermark не обнаружен** (2/4 в noreason — неоднозначно) |
 
@@ -106,9 +106,11 @@ python3 status.py                                      # статус прого
 |---|---|---|
 | [![gsq](data/watermark_report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.png)](data/watermark_report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.png) | [![rco](data/watermark_report_Swift-Qwen3.8-27B-RCO_IQ3_S.png)](data/watermark_report_Swift-Qwen3.8-27B-RCO_IQ3_S.png) | [![7b](data/watermark_report_qwen2.5-7b-openstamp-L251_Q8_0.png)](data/watermark_report_qwen2.5-7b-openstamp-L251_Q8_0.png) |
 
-- **27B-прогон GSQ** (30 промптов × 2 режима, 400 токенов): ни один детектор
-  вердикт не выдал — LLR и G-значения Swift-1.5 и Qwen3.8-27B
-  неотличимы (G ≈ 0.50 с обеих сторон, смещения выше бернулли-нуля нет).
+- **27B-прогон GSQ** (60 промптов × 2 режима; в reason исключено 31
+  текстов с пустым выходом → n = 38): ни один детектор вердикт не
+  выдал — максимум t = +2.89 (LLR/GaussMark, noreason), ниже порога 3;
+  LLR и G-значения Swift-1.5 и Qwen3.8-27B неотличимы (G ≈ 0.50 с
+  обеих сторон, смещения выше бернулли-нуля нет).
 - **27B-прогон RCO** (60 промптов × 2 режима; в reason исключено 25
   текстов с пустым выходом): в reasoning off два детектора
   (OpenStamp + GaussMark — одна и та же статистика первого порядка)
