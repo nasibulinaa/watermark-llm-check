@@ -946,9 +946,10 @@ def main():
     def _missing():
         for tag in ("wm", "base"):
             for mode in MODES:
-                if tag not in data or mode not in data.get(tag, {}):
+                rows = data.get(tag, {}).get(mode, [])
+                if len(rows) < len(prompts):
                     return True
-                for r in data[tag][mode]:
+                for r in rows:
                     if not r.get("text", "").strip():
                         continue
                     if "L_wm" not in r or "L_base" not in r:
