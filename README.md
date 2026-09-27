@@ -34,7 +34,7 @@ watermarked-кандидата.
 detect.py      # main: сервер, генерация, скоринг, анализ, отчёт
 test_llr.py    # эквивалентность по-токенного LLR и openstamp/src/llr.py
 smoke.py       # ручной smoke-тест сервера (thinking + grammar-score)
-status.py      # статус прогона по data.json
+status.py      # статус прогона по data_*.json
 openstamp/     # сабмодуль: референс OpenStamp (METHOD.md, src/llr.py)
 synthid-text/  # сабмодуль: референс SynthID-Text (модули)
 gaussmark/     # сабмодуль: референс GaussMark (метод, p-value)
@@ -72,11 +72,11 @@ python3 status.py                                      # статус прого
 `--models-dir`), `--wm-model/--base-model` (имена в отчёте), `--quant`
 (квантизация в именах отчёта; по умолчанию — из имени wm-GGUF), `--llama-bin`
 (бинарь llama-server), `--device` (например `cuda0`, `ROCm1`, `cpu`),
-`--prompts` (по умолчанию 30), `--tokens` (по умолчанию 400).
+`--prompts` (по умолчанию 60), `--tokens` (по умолчанию 400).
 
 ## Прогон
 
-1. **Генерация** — N текстов (по умолчанию 30) в двух режимах
+1. **Генерация** — N текстов (по умолчанию 60) в двух режимах
    (reasoning on/off); в VRAM одна модель за раз, сервер
    перезапускается со второй моделью;
 2. **Скоринг** — L = Σ log p(x_t|x_<t>) для полной 2×2-матрицы

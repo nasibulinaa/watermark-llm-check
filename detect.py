@@ -734,7 +734,7 @@ def make_plot(cfg, llrs, synth, gm, e2e, aggs, res_path):
         llr_wm, llr_null = llrs[mode]
         gw = np.array([r["mean_g"] for r in synth["wm"][mode]])
         gb = np.array([r["mean_g"] for r in synth["base"][mode]])
-        gm_wm, gm_null, gm_p = gm[mode]
+        gm_wm, gm_null, _p = gm[mode]
         pw = np.array([r["p"] for r in e2e["wm"][mode]])
         pb = np.array([r["p"] for r in e2e["base"][mode]])
         a_llr, a_gm = aggs["llr"][mode], aggs["gm"][mode]
