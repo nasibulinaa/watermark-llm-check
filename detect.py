@@ -773,33 +773,49 @@ def main():
         # Генерация и скоринг через llama-server (одна модель в VRAM за раз)
         mgr = ServerManager(cfg)
         try:
-            # Фаза 1: генерация (wm-модель — оба режима, base-модель — оба)
-            model_id = mgr.ensure_model(cfg.wm_gguf)
-            srv = Server(cfg, model_id)
-            for mode in MODES:
-                have = len(data.get("wm", {}).get(mode, []))
-                if have < len(prompts):
-                    collect(cfg, srv, prompts, cfg.tokens, data, "wm",
-                            mode, start=have)
-            model_id = mgr.ensure_model(cfg.base_gguf)
-            srv = Server(cfg, model_id)
-            for mode in MODES:
-                have = len(data.get("base", {}).get(mode, []))
-                if have < len(prompts):
-                    collect(cfg, srv, prompts, cfg.tokens, data, "base",
-                            mode, start=have)
-            # Скоринг: L_wm под WM-моделью, L_base под BASE-моделью
-            # (score_texts_server сам пропускает готовые строки)
-            model_id = mgr.ensure_model(cfg.wm_gguf)
-            srv = Server(cfg, model_id)
-            for tag in ("wm", "base"):
+            # Порядок фаз минимизирует загрузки модели (кэш текстов и
+            # значений L — в data-файле, готовые строки пропускаются):
+            #   1) wm:   сборка wm + L_wm на wm-текстах
+            #   2) base: сборка base + L_base на всех текстах
+            #   3) wm:   L_wm на base-текстах
+            # Модель загружается только если для неё есть работа.
+            def _need_collect(tag):
+                return any(len(data.get(tag, {}).get(mode, []))
+                           < len(prompts) for mode in MODES)
+
+            def _need_score(field, tags):
+                return any(r.get("text", "").strip() and field not in r
+                           for tag in tags for mode in MODES
+                           for r in data.get(tag, {}).get(mode, []))
+
+            # Фаза 1 (wm): сборка wm-текстов + L_wm на них
+            if _need_collect("wm") or _need_score("L_wm", ("wm",)):
+                srv = Server(cfg, mgr.ensure_model(cfg.wm_gguf))
                 for mode in MODES:
-                    score_texts_server(cfg, srv, data, tag, mode, "L_wm")
-            model_id = mgr.ensure_model(cfg.base_gguf)
-            srv = Server(cfg, model_id)
-            for tag in ("wm", "base"):
+                    have = len(data.get("wm", {}).get(mode, []))
+                    if have < len(prompts):
+                        collect(cfg, srv, prompts, cfg.tokens, data,
+                                "wm", mode, start=have)
                 for mode in MODES:
-                    score_texts_server(cfg, srv, data, tag, mode, "L_base")
+                    score_texts_server(cfg, srv, data, "wm", mode, "L_wm")
+            # Фаза 2 (base): сборка base-текстов + L_base на всех
+            if (_need_collect("base")
+                    or _need_score("L_base", ("wm", "base"))):
+                srv = Server(cfg, mgr.ensure_model(cfg.base_gguf))
+                for mode in MODES:
+                    have = len(data.get("base", {}).get(mode, []))
+                    if have < len(prompts):
+                        collect(cfg, srv, prompts, cfg.tokens, data,
+                                "base", mode, start=have)
+                for tag in ("wm", "base"):
+                    for mode in MODES:
+                        score_texts_server(cfg, srv, data, tag, mode,
+                                           "L_base")
+            # Фаза 3 (wm): L_wm на base-текстах
+            if _need_score("L_wm", ("base",)):
+                srv = Server(cfg, mgr.ensure_model(cfg.wm_gguf))
+                for mode in MODES:
+                    score_texts_server(cfg, srv, data, "base", mode, "L_wm")
         finally:
             mgr.kill()
 
