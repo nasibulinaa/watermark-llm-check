@@ -2,8 +2,11 @@
 __pycache__/
 *.pyc
 
-# результаты прогонов
-data*/*
+# результаты прогонов (raw-данные и отчёты в git; логи и тексты — нет)
+data*/wm_*.txt
+data*/base_*.txt
+data*/server_*.log
+!data*/data_*.json
 !data*/report_*.json
 !data*/watermark_report_*.png
 

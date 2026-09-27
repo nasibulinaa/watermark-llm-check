@@ -4,3 +4,9 @@
 [submodule "synthid-text"]
 	path = synthid-text
 	url = https://github.com/google-deepmind/synthid-text
+[submodule "gaussmark"]
+	path = gaussmark
+	url = https://github.com/abblock/gaussmark.git
+[submodule "markllm"]
+	path = markllm
+	url = https://github.com/THU-BPM/MarkLLM.git

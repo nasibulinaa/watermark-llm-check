@@ -3,7 +3,7 @@ r"""
 Утилита детекции watermark в выводе LLM: сравнивает watermarked-кандидата
 и базовую модель (обе — llama-server, одна модель в VRAM за раз).
 
-Два детектора по публичным референс-реализациям (git-сабмодули):
+Четыре детектора по публичным референс-реализациям (git-сабмодули):
 
 1) OpenStamp — length-normalized log-likelihood ratio между моделями,
    ключ не нужен:
@@ -17,6 +17,19 @@ r"""
    ngram_len=5, 30 ключей, context_history_size=1024). Null-среднее
    G = 0.5 (Bernoulli-биты); у watermarked-текста смещается вверх
    (~0.75).
+
+3) GaussMark — структурный watermark (шум в весах). Статистика
+   бумаги score(T) = <grad_base(T), W> (W — гауссов шум-ключ).
+   Без ключа W недоступен; для малого весового смещения
+   (структурный watermark) по тождеству первого порядка
+   <grad_base(T), dtheta> ~= L_wm(T) - L_base(T), dtheta =
+   theta_wm - theta_base. p-value — по схеме бумаги (нормальное
+   распределение, null — тексты базовой модели).
+
+4) MarkLLM — E2E-LLM-Watermark (нейронный детектор, ключ не
+   нужен): LSTM-детектор по эмбеддингам токенов opt-1.3b,
+   score = P(watermarked) на текст. Референс:
+   markllm/watermark/e2e/ (checkpoint 35000.pth в models/).
 
 Прогон: генерация (reasoning on/off) -> скоринг L под обеими моделями
 (GBNF-грамматики, pre-sampling logprobs) -> анализ, отчёт, график.
@@ -490,6 +503,41 @@ def openstamp_llrs(data):
 
 
 # --------------------------------------------------------------------------
+# Детектор 3: GaussMark (структурный watermark, ключевая версия)
+# --------------------------------------------------------------------------
+def gaussmark_scores(data):
+    """Статистика GaussMark без ключа (см. docstring, п.3).
+
+    score(T) = (L_wm(T) - L_base(T)) / (n_scored - 1) — та же
+    length-normalized разность, что и LLR OpenStamp (первый порядок
+    по dtheta). p-value строится по схеме бумаги: null-распределение
+    N(mu0, sd0^2) по тексту базовой модели, p_i = P(Z > (s_i - mu0)/sd0).
+
+    -> {mode: (score_wm, score_null, p_wm)}"""
+    out = {}
+    for mode in MODES:
+        wm_recs, base_recs = data["wm"][mode], data["base"][mode]
+        s_wm, s_null = [], []
+        for i in range(min(len(wm_recs), len(base_recs))):
+            a, b = wm_recs[i], base_recs[i]
+            ok = (a.get("text", "").strip() and b.get("text", "").strip()
+                  and all(k in r for r, k in ((a, "L_wm"), (a, "L_base"),
+                                             (b, "L_wm"), (b, "L_base"))))
+            if not ok:
+                continue
+            s_wm.append((a["L_wm"] - a["L_base"])
+                        / max(a.get("n_scored", a["n"]) - 1, 1))
+            s_null.append((b["L_wm"] - b["L_base"])
+                          / max(b.get("n_scored", b["n"]) - 1, 1))
+        s_wm, s_null = np.asarray(s_wm), np.asarray(s_null)
+        mu0, sd0 = float(s_null.mean()), float(s_null.std(ddof=1))
+        p_wm = 0.5 * np.array([math.erfc(x / math.sqrt(2))
+                               for x in (s_wm - mu0) / sd0])
+        out[mode] = (s_wm, s_null, p_wm)
+    return out
+
+
+# --------------------------------------------------------------------------
 # Детектор 2: SynthID-Text (G-значения, модули из сабмодуля synthid-text)
 # --------------------------------------------------------------------------
 class SynthIDDetector:
@@ -554,6 +602,66 @@ def synthid_scores(cfg, data, det):
 
 
 # --------------------------------------------------------------------------
+# Детектор 4: MarkLLM — E2E-LLM-Watermark (нейронный, ключ не нужен)
+# --------------------------------------------------------------------------
+class MarkLLMDetector:
+    """E2E-LLM-Watermark (markllm/watermark/e2e): LSTM-детектор по
+    эмбеддингам токенов opt-1.3b; score = P(watermarked) на текст.
+    Checkpoint 35000.pth — models/e2e-35000.pth (SHA-256 задокументирован
+    в markllm/watermark/e2e/README.md)."""
+
+    REF_MODEL = "facebook/opt-1.3b"
+
+    def __init__(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "e2e_model", os.path.join(ROOT, "markllm", "watermark",
+                                      "e2e", "model.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ckpt = torch.load(os.path.join(ROOT, "models", "e2e-35000.pth"),
+                          map_location="cpu", weights_only=True)
+        self.detector = mod.E2EDetector(
+            input_dim=ckpt["dec"]["lstm.weight_ih_l0"].shape[1],
+            hidden_dim=64, num_classes=1, num_layers=3)
+        self.detector.load_state_dict(ckpt["dec"])
+        self.detector.eval()
+        from transformers import AutoTokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(self.REF_MODEL)
+        w = torch.load(os.path.join(ROOT, "models",
+                                    "opt-1.3b-embeddings.pt"),
+                       map_location="cpu")
+        self.emb = torch.nn.Embedding.from_pretrained(w)
+
+    @torch.inference_mode()
+    def score(self, text):
+        """-> P(watermarked) в [0, 1] для одного текста."""
+        ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
+        if not ids:
+            raise ValueError("E2E не детектирует пустой текст")
+        x = self.emb(torch.tensor([ids])).float()
+        return float(torch.sigmoid(self.detector(x)).item())
+
+
+def markllm_scores(data, det):
+    """-> {tag: {mode: [rows]}}: P(watermarked) по E2E, пары по промптам
+    (учитываются пары, где тексты обеих моделей непустые)."""
+    out = {"wm": {}, "base": {}}
+    for mode in MODES:
+        wm_recs, base_recs = data["wm"][mode], data["base"][mode]
+        wm_rows, base_rows = [], []
+        for i in range(min(len(wm_recs), len(base_recs))):
+            a, b = wm_recs[i], base_recs[i]
+            if not (a.get("text", "").strip() and b.get("text", "").strip()):
+                continue
+            wm_rows.append({"p": det.score(a["text"])})
+            base_rows.append({"p": det.score(b["text"])})
+        out["wm"][mode] = wm_rows
+        out["base"][mode] = base_rows
+    return out
+
+
+# --------------------------------------------------------------------------
 # Статистика и вердикт
 # --------------------------------------------------------------------------
 def aggregate(signal, null):
@@ -594,50 +702,87 @@ def aggregate(signal, null):
     }
 
 
+def pvalue_fields(p_wm):
+    """Поле отчёта: p-значения по схеме GaussMark (нормальный test)."""
+    p_wm = np.asarray(p_wm, dtype=float)
+    return {
+        "p_wm_mean": float(p_wm.mean()),
+        "p_wm_min": float(p_wm.min()),
+        "p_hits_005": int((p_wm < 0.05).sum()),
+    }
+
+
 # --------------------------------------------------------------------------
 # График
 # --------------------------------------------------------------------------
-def make_plot(cfg, llrs, synth, aggs, res_path):
-    """2×2-график: LLR и mean G, reasoning on/off; сохранение в res_path."""
+def make_plot(cfg, llrs, synth, gm, e2e, aggs, res_path):
+    """4×2-график: LLR, mean G, GaussMark-score, E2E-P; reasoning on/off.
+    aggs = {"llr": ..., "synth": ..., "gm": ..., "e2e": ...} по режимам."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8.5))
+    fig, axes = plt.subplots(4, 2, figsize=(13, 19))
     fig.suptitle(f"Watermark detection: {cfg.wm_name} vs {cfg.base_name}\n"
-                 "(OpenStamp LLR + SynthID-Text G-values; "
-                 "columns: reasoning on/off)", fontsize=13)
+                 "(OpenStamp LLR, SynthID G, GaussMark score, "
+                 "MarkLLM E2E-P; columns: reasoning on/off)", fontsize=13)
+
+
 
     for c, mode in enumerate(MODES):
         on = "on" if mode == "reason" else "off"
         llr_wm, llr_null = llrs[mode]
         gw = np.array([r["mean_g"] for r in synth["wm"][mode]])
         gb = np.array([r["mean_g"] for r in synth["base"][mode]])
+        gm_wm, gm_null, gm_p = gm[mode]
+        pw = np.array([r["p"] for r in e2e["wm"][mode]])
+        pb = np.array([r["p"] for r in e2e["base"][mode]])
+        a_llr, a_gm = aggs["llr"][mode], aggs["gm"][mode]
 
-        ax = axes[0][c]
-        ax.hist(llr_null, bins=12, alpha=0.55, color="tab:blue",
-                label="base texts (null)")
-        ax.hist(llr_wm, bins=12, alpha=0.55, color="tab:red",
-                label=f"{cfg.wm_name} texts (signal)")
-        ax.axvline(aggs[mode]["tau"], color="k", ls="--", lw=1.5,
-                   label=f"tau = {aggs[mode]['tau']:.3f}")
-        ax.set_title(f"OpenStamp: length-normalized LLR per text "
-                     f"(reasoning {on})")
-        ax.set_xlabel("LLR (nats/token)")
-        ax.legend()
+        def _panel(row, wm, null, title, xlabel, extra=None,
+                   verdict=None):
+            ax = axes[row][c]
+            ax.hist(null, bins=12, alpha=0.55, color="tab:blue",
+                    label="base texts (null)")
+            ax.hist(wm, bins=12, alpha=0.55, color="tab:red",
+                    label=f"{cfg.wm_name} texts (signal)")
+            for x, ls, label in extra:
+                ax.axvline(x, color="k", ls=ls, lw=1.5, label=label)
+            ax.set_title(f"{title} (reasoning {on})")
+            ax.set_xlabel(xlabel)
+            ax.legend()
+            if verdict is not None:
+                txt = "WATERMARK FOUND" if verdict else "NO WATERMARK"
+                ax.text(0.99, 0.97, txt, transform=ax.transAxes,
+                        ha="right", va="top", fontsize=11,
+                        fontweight="bold", color="white", zorder=5,
+                        bbox=dict(boxstyle="round,pad=0.35",
+                                  fc="tab:red" if verdict else "tab:green",
+                                  ec="none", alpha=0.9))
 
-        ax = axes[1][c]
-        ax.hist(gb, bins=12, alpha=0.55, color="tab:blue",
-                label="base texts (null)")
-        ax.hist(gw, bins=12, alpha=0.55, color="tab:red",
-                label=f"{cfg.wm_name} texts (signal)")
-        ax.axvline(0.5, color="k", ls="--", lw=1.5, label="null mean = 0.5")
-        ax.axvline(0.75, color="gray", ls=":", lw=1.5,
-                   label="expected watermarked ~ 0.75")
-        ax.set_title(f"SynthID-Text: mean G-value per text "
-                     f"(reasoning {on})")
-        ax.set_xlabel("mean G")
-        ax.legend()
+        _panel(0, llr_wm, llr_null,
+               "OpenStamp: LLR per text",
+               "LLR (nats/token)",
+               [(a_llr["tau"], "--", f"tau = {a_llr['tau']:.3f}")],
+               verdict=aggs["llr"][mode]["verdict"])
+
+        _panel(1, gw, gb, "SynthID-Text: mean G per text",
+               "mean G",
+               [(0.5, "--", "null mean = 0.5"),
+                (0.75, ":", "expected watermarked ~ 0.75")],
+               verdict=aggs["synth"][mode]["verdict"])
+
+        _panel(2, gm_wm, gm_null,
+               f"GaussMark: score (p_wm mean = {a_gm['p_wm_mean']:.3f})",
+               "score (nats/token)",
+               [(a_gm["tau"], "--", f"tau = {a_gm['tau']:.3f}")],
+               verdict=aggs["gm"][mode]["verdict"])
+
+        _panel(3, pw, pb,
+               f"MarkLLM E2E: P(wm) (p_wm mean = {pw.mean():.3f})",
+               "P(watermarked)",
+               [(0.5, "--", "detection threshold = 0.5")],
+               verdict=aggs["e2e"][mode]["verdict"])
 
     fig.tight_layout(rect=[0, 0, 1, 0.94])
     fig.savefig(res_path, dpi=150)
@@ -647,7 +792,8 @@ def make_plot(cfg, llrs, synth, aggs, res_path):
 # --------------------------------------------------------------------------
 # Отчёт
 # --------------------------------------------------------------------------
-def print_report(cfg, llrs, synth, aggs_llr, aggs_syn):
+def print_report(cfg, llrs, synth, gm, e2e, aggs_llr, aggs_syn,
+                 aggs_gm, aggs_e2e):
     """Печатный отчёт: цифры и вердикт по каждому детектору и режиму."""
     print()
     print("=" * 78)
@@ -659,9 +805,13 @@ def print_report(cfg, llrs, synth, aggs_llr, aggs_syn):
         on = "on" if mode == "reason" else "off"
         a_llr = aggs_llr[mode]
         a_syn = aggs_syn[mode]
+        a_gm = aggs_gm[mode]
+        a_e2e = aggs_e2e[mode]
         gw = np.array([r["mean_g"] for r in synth["wm"][mode]])
         gb = np.array([r["mean_g"] for r in synth["base"][mode]])
         zw = np.array([r["z"] for r in synth["wm"][mode]])
+        pw = np.array([r["p"] for r in e2e["wm"][mode]])
+        pb = np.array([r["p"] for r in e2e["base"][mode]])
         print()
         print(f"=== reasoning: {on} ===")
         print("[1] OpenStamp — length-normalized LLR (wm vs base)")
@@ -688,16 +838,37 @@ def print_report(cfg, llrs, synth, aggs_llr, aggs_syn):
         print(f"    t-сводка (спаренный): {a_syn['t_agg']:+.2f}   "
               f"z-сводка: {a_syn['z_agg']:+.2f}")
         print(f"    => {'WATERMARK ОБНАРУЖЕН' if a_syn['verdict'] else 'watermark не обнаружен'}")
+        print()
+        print("[3] GaussMark — score = <grad_base, dtheta> (первый "
+              "порядок), p-value по схеме бумаги")
+        print(f"    {cfg.wm_name}-тексты : mean={a_gm['signal_mean']:+.4f}  "
+              f"(null {a_gm['null_mean']:+.4f})")
+        print(f"    p-value: mean={a_gm['p_wm_mean']:.4f}  "
+              f"min={a_gm['p_wm_min']:.4f}  "
+              f"p<0.05: {a_gm['p_hits_005']}/{a_gm['n']}")
+        print(f"    t-сводка (спаренный): {a_gm['t_agg']:+.2f}   "
+              f"z-сводка: {a_gm['z_agg']:+.2f}")
+        print(f"    => {'WATERMARK ОБНАРУЖЕН' if a_gm['verdict'] else 'watermark не обнаружен'}")
+        print()
+        print("[4] MarkLLM E2E — P(watermarked) (нейронный детектор)")
+        print(f"    {cfg.wm_name}-тексты : mean P={pw.mean():.4f}  "
+              f"(null {pb.mean():.4f}, порог 0.5)")
+        print(f"    P > 0.5: {int((pw > 0.5).sum())}/{len(pw)}")
+        print(f"    {cfg.wm_name} > tau: {a_e2e['hits']}/{a_e2e['n']} "
+              f"({a_e2e['hit_rate']*100:.1f}%)")
+        print(f"    t-сводка (спаренный): {a_e2e['t_agg']:+.2f}   "
+              f"z-сводка: {a_e2e['z_agg']:+.2f}")
+        print(f"    => {'WATERMARK ОБНАРУЖЕН' if a_e2e['verdict'] else 'watermark не обнаружен'}")
     print()
     print("=" * 78)
     for mode in MODES:
         on = "on" if mode == "reason" else "off"
-        v_llr = aggs_llr[mode]["verdict"]
-        v_syn = aggs_syn[mode]["verdict"]
-        if v_llr and v_syn:
-            s = "watermark ВЫЯВЛЕН обоими детекторами"
-        elif v_llr or v_syn:
-            s = ("watermark выявлен одним детектором — результат "
+        k = sum(a[mode]["verdict"] for a in
+                (aggs_llr, aggs_syn, aggs_gm, aggs_e2e))
+        if k == 4:
+            s = "watermark ВЫЯВЛЕН всеми детекторами"
+        elif k:
+            s = (f"watermark выявлен {k} из 4 детекторов — результат "
                  "однозначным не является, нужны данные с известным ключом")
         else:
             s = ("watermark НЕ выявлен ни одним детектором "
@@ -853,14 +1024,23 @@ def main():
     llrs = openstamp_llrs(data)
     det = SynthIDDetector()
     synth = synthid_scores(cfg, data, det)
+    gm = gaussmark_scores(data)
+    e2e_det = MarkLLMDetector()
+    e2e = markllm_scores(data, e2e_det)
 
-    aggs_llr, aggs_syn = {}, {}
+    aggs_llr, aggs_syn, aggs_gm, aggs_e2e = {}, {}, {}, {}
     for mode in MODES:
         llr_wm, llr_null = llrs[mode]
+        gm_wm, gm_null, gm_p = gm[mode]
         aggs_llr[mode] = aggregate(llr_wm, llr_null)
         aggs_syn[mode] = aggregate(
             np.array([r["mean_g"] for r in synth["wm"][mode]]),
             np.array([r["mean_g"] for r in synth["base"][mode]]))
+        aggs_gm[mode] = dict(aggregate(gm_wm, gm_null),
+                             **pvalue_fields(gm_p))
+        aggs_e2e[mode] = aggregate(
+            np.array([r["p"] for r in e2e["wm"][mode]]),
+            np.array([r["p"] for r in e2e["base"][mode]]))
     n_empty = sum(
         1 for tag in ("wm", "base") for mode in MODES
         for r in data[tag][mode] if not r.get("text", "").strip())
@@ -871,19 +1051,29 @@ def main():
     q = quant_suffix(cfg.quant)
     report_name = f"report_{cfg.wm_name}{q}.json"
     plot_name = f"watermark_report_{cfg.wm_name}{q}.png"
-    make_plot(cfg, llrs, synth, aggs_llr, os.path.join(cfg.data, plot_name))
-    print_report(cfg, llrs, synth, aggs_llr, aggs_syn)
+    make_plot(cfg, llrs, synth, gm, e2e,
+              {"llr": aggs_llr, "synth": aggs_syn, "gm": aggs_gm,
+               "e2e": aggs_e2e},
+              os.path.join(cfg.data, plot_name))
+    print_report(cfg, llrs, synth, gm, e2e, aggs_llr, aggs_syn,
+                 aggs_gm, aggs_e2e)
 
     per_seq = {mode: {
         "llr_wm": [float(x) for x in llrs[mode][0]],
         "llr_null": [float(x) for x in llrs[mode][1]],
         "mean_g_wm": [r["mean_g"] for r in synth["wm"][mode]],
         "mean_g_base": [r["mean_g"] for r in synth["base"][mode]],
+        "gm_wm": [float(x) for x in gm[mode][0]],
+        "gm_null": [float(x) for x in gm[mode][1]],
+        "gm_p_wm": [float(x) for x in gm[mode][2]],
+        "e2e_p_wm": [r["p"] for r in e2e["wm"][mode]],
+        "e2e_p_base": [r["p"] for r in e2e["base"][mode]],
     } for mode in MODES}
     report = {
         "wm_model": cfg.wm_name,
         "base_model": cfg.base_name,
-        "modes": {m: {"openstamp_llr": aggs_llr[m], "synthid": aggs_syn[m]}
+        "modes": {m: {"openstamp_llr": aggs_llr[m], "synthid": aggs_syn[m],
+                     "gaussmark": aggs_gm[m], "markllm_e2e": aggs_e2e[m]}
                   for m in MODES},
         "per_sequence": per_seq,
         "plot": plot_name,

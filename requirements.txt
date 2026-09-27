@@ -1,4 +1,5 @@
 numpy
 requests
 torch
+transformers
 matplotlib
