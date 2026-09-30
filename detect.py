@@ -10,13 +10,17 @@ r"""
 
        $LLR(x) = \frac{1}{T-1}\sum_{t=1}^{T-1}\log\frac{p_{\text{wm}}(x_t \mid x_{<t})}{p_{\text{base}}(x_t \mid x_{<t})}$
 
-   Референс: openstamp/src/llr.py (эквивалентность — test_llr.py).
-   Порог τ калибруется по null-текстам: mean + 3std.
+   Референс: openstamp/src/llr.py (эквивалентность — test_llr.py):
+   labels = ids[2:] — первый текст-токен и хвостовой EOG (llama.cpp
+   дописывает один EOS после завершения GBNF-грамматики) в сумму не
+   входят; нормализация — на число посчитанных токенов. Порог τ
+   калибруется по null-текстам: mean + 3std.
 
 2) SynthID-Text — keyed-hash G-значения (DEFAULT_WATERMARKING_CONFIG:
    ngram_len=5, 30 ключей, context_history_size=1024). Null-среднее
    G = 0.5 (Bernoulli-биты); у watermarked-текста смещается вверх
-   (~0.75).
+   (~0.75). EOS-маска — по референсу (compute_eos_token_mask, EOG
+   модели — --eos-token).
 
 3) GaussMark — структурный watermark (шум в весах). Статистика
    бумаги score(T) = <grad_base(T), W> (W — гауссов шум-ключ).
@@ -139,9 +143,11 @@ class Config:
     port: int = 8091
     server_ctx: int = 8192
     server_batch: int = 2048
-    # Протокол
     prompts: int = 60
     tokens: int = 400
+    # EOG-токен моделей (Qwen3.8: 248046): исключается из L (хвостовой
+    # EOG после завершения GBNF-грамматики) и задаёт EOS-маску SynthID
+    eos_token: int = 248046
     data: str = os.path.join(ROOT, "data")
 
 
@@ -357,6 +363,7 @@ class Server:
     def __init__(self, cfg, model_id, timeout=900):
         """HTTP-клиент для одной модели; model_id — id из /v1/models."""
         self.base = f"http://{cfg.host}:{cfg.port}"
+        self.eos_token = cfg.eos_token
         self.s = requests.Session()
         self.s.headers["Content-Type"] = "application/json"
         self.timeout = timeout
@@ -387,8 +394,11 @@ class Server:
     def score(self, prompt, text, n_tokens):
         """L = Σ log p(x_t|x_<t) под текущей моделью (pre-sampling
         logprobs, enable_thinking=false, текст зафиксирован GBNF).
-        -> (L, n_scored); n_scored может слегка превышать n_tokens
-        (ре-токенизация). Первый текст-токен не входит (labels = ids[2:])."""
+        -> (L, n_scored); n_scored — число текст-токенов (без BOS и
+        без хвостового EOG), может слегка превышать n_tokens
+        (ре-токенизация). По референсу (openstamp/src/llr.py):
+        labels = ids[2:], logits [:, 1:-1] — первый текст-токен и EOS
+        в сумму не входят; нормализация — на n_scored - 1."""
         if not text:
             raise SystemExit("[score] пустой текст — строка исключена из "
                              "скоринга (см. score_texts_server)")
@@ -398,8 +408,9 @@ class Server:
             "messages": [{"role": "user", "content": prompt}],
             "grammar": grammar,
             "max_tokens": n_tokens + 1000,
-            # запас на ре-токенизацию; после грамматики сервер
-            # догенерит до max_tokens — хвост в ответ не входит
+            # запас на ре-токенизацию; после завершения грамматики
+            # в кандидатах остаётся только EOG — сервер дописывает
+            # один EOS-токен, он в logprobs, но в L не входит
             "logprobs": True, "top_logprobs": 1,
             "temperature": 1.0,
             "top_k": 1,
@@ -421,7 +432,12 @@ class Server:
         if len(lps) < 2:
             raise SystemExit(f"[score] в ответе мало logprobs: {len(lps)} "
                              f"при {len(text)} символах текста")
-        return sum(t["logprob"] for t in lps[1:]), len(lps)
+        n = len(lps)
+        # хвостовой EOG (после завершения грамматики) в L не входит:
+        # в input_ids референса EOS отсутствует
+        if lps[-1]["id"] == self.eos_token:
+            n -= 1
+        return sum(t["logprob"] for t in lps[1:n]), n
 
 # --------------------------------------------------------------------------
 # Сбор данных
@@ -541,11 +557,13 @@ def gaussmark_scores(data):
 # Детектор 2: SynthID-Text (G-значения, модули из сабмодуля synthid-text)
 # --------------------------------------------------------------------------
 class SynthIDDetector:
-    def __init__(self):
-        """SynthID-детектор; конфиг — DEFAULT_WATERMARKING_CONFIG (сабмодуль)."""
+    def __init__(self, eos_token=0):
+        """SynthID-детектор; конфиг — DEFAULT_WATERMARKING_CONFIG (сабмодуль).
+        eos_token — EOG модели (0 — без EOS-маски)."""
         from synthid_text import logits_processing
         from synthid_text.synthid_mixin import DEFAULT_WATERMARKING_CONFIG
         self.cfg = dict(DEFAULT_WATERMARKING_CONFIG)
+        self.eos_token = eos_token
         self.proc = logits_processing.SynthIDLogitsProcessor(
             ngram_len=self.cfg["ngram_len"],
             keys=list(self.cfg["keys"]),
@@ -561,16 +579,15 @@ class SynthIDDetector:
         ids = torch.tensor([token_ids], dtype=torch.long)
         g = self.proc.compute_g_values(ids)                    # [1, L-4, 30]
         rep = self.proc.compute_context_repetition_mask(ids)    # [1, L-4]
-        L = len(token_ids)
-        # маска EOS: нули с первого EOS (конец генерации) до конца
-        eos_mask = torch.ones(1, L)
-        for j, t in enumerate(token_ids):
-            if t in (151643, 151645):  # eos-токены семейства Qwen
-                eos_mask[0, j:] = 0
-                break
-        # выравнивание под README: eos_mask[:, ngram_len-1:]
-        eos_align = eos_mask[0, self.cfg["ngram_len"] - 1:]
-        combined = (rep[0] * eos_align).to(torch.float32).unsqueeze(0)
+        # EOS-маска по референсу (compute_eos_token_mask): нули с
+        # первого EOG до конца; выравнивание [:, ngram_len-1:]
+        if self.eos_token:
+            eos_mask = self.proc.compute_eos_token_mask(
+                ids, self.eos_token)                            # [1, L]
+            eos_align = eos_mask[0, self.cfg["ngram_len"] - 1:]
+            combined = (rep[0] * eos_align).to(torch.float32).unsqueeze(0)
+        else:
+            combined = rep[0].to(torch.float32).unsqueeze(0)
         if int(combined.sum()) == 0:
             return 0.5, 0.0, 0
         score = float(detector_mean.mean_score(g.numpy(), combined.numpy())[0])
@@ -908,6 +925,9 @@ def main():
     # Протокол
     ap.add_argument("--prompts", type=int, default=Config.prompts)
     ap.add_argument("--tokens", type=int, default=Config.tokens)
+    ap.add_argument("--eos-token", type=int, default=Config.eos_token,
+                    help="EOG-токен моделей: исключается из L и задаёт "
+                         "EOS-маску SynthID (0 — без маски)")
     ap.add_argument("--analyze-only", action="store_true",
                     help="не собирать, только анализ по data-файлу")
     ap.add_argument("--resume", action="store_true",
@@ -929,6 +949,7 @@ def main():
         data=args.data,
         prompts=args.prompts,
         tokens=args.tokens,
+        eos_token=args.eos_token,
     )
 
     data_path = os.path.join(cfg.data,
@@ -1023,7 +1044,7 @@ def main():
 
     # Анализ
     llrs = openstamp_llrs(data)
-    det = SynthIDDetector()
+    det = SynthIDDetector(eos_token=cfg.eos_token)
     synth = synthid_scores(cfg, data, det)
     gm = gaussmark_scores(data)
     e2e_det = MarkLLMDetector()

@@ -81,7 +81,11 @@ python3 status.py                                      # статус прого
    перезапускается со второй моделью;
 2. **Скоринг** — L = Σ log p(x_t|x_<t>) для полной 2×2-матрицы
    (тексты × модели) через GBNF-грамматики (pre-sampling logprobs);
+   в L не входят первый текстовый токен и завершающий EOG
+   (id модели, например 248046 у Qwen3.8; `--eos-token`);
    пустые тексты (зацикливание на спец-токенах) исключаются из анализа;
+   SynthID-маскирование EOG — через референсный
+   `compute_eos_token_mask` с реальным EOG модели;
 3. **Анализ** — 4 детектора, отчёт, график. Вердикт — спаренный
    t-критерий по разностям (signal − null) на общих промптах:
    t ≥ 3 и большинство разностей положительные.
@@ -96,9 +100,10 @@ python3 status.py                                      # статус прого
 
 | Прогон | wm (кандидат) | base | Квант | OpenStamp (LLR) | SynthID (G) | GaussMark | MarkLLM E2E (P) | Вердикт |
 |---|---|---|---|---|---|---|---|---|
-| [`report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.json`](data/report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.json) | Swift-1.5-Qwen3.8-27B-GSQ-RCO | Qwen3.8-27B-GSQ-RCO | IQ3_S | +0.28 / +2.89 (n = 38/60) | −0.91 / +1.59 | +0.28 / +2.89 | +2.28 / −1.08 | **watermark не обнаружен** |
-| [`report_qwen2.5-7b-openstamp-L251_Q8_0.json`](data/report_qwen2.5-7b-openstamp-L251_Q8_0.json) | qwen2.5-7b-openstamp-L251 | Qwen2.5-7B | Q8_0 | +13.72 / +9.80 (n = 60) | −0.62 / +0.51 | +13.72 / +9.80 (p<0.05: 50/60, 15/60) | −0.01 / +0.19 | **watermark обнаружен** (OpenStamp + GaussMark) |
-| [`report_Swift-Qwen3.8-27B-RCO_IQ3_S.json`](data/report_Swift-Qwen3.8-27B-RCO_IQ3_S.json) | Swift-Qwen3.8-27B-RCO | Qwen3.8-27B-GSQ-RCO | IQ3_S | +2.88 / +3.56 | −0.71 / +0.43 | +2.88 / +3.56 | −0.71 / −0.61 | **watermark не обнаружен** (2/4 в noreason — неоднозначно) |
+| [`report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.json`](data/report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.json) | Swift-1.5-Qwen3.8-27B-GSQ-RCO | Qwen3.8-27B-GSQ-RCO | IQ3_S | −0.23 / +2.80 (n = 38/60) | −0.97 / +1.64 | −0.23 / +2.80 (p<0.05: 0/0, 1/1) | +2.28 / −1.08 | **watermark не обнаружен** |
+| [`report_qwen2.5-7b-openstamp-L251_Q8_0.json`](data/report_qwen2.5-7b-openstamp-L251_Q8_0.json) | qwen2.5-7b-openstamp-L251 | Qwen2.5-7B | Q8_0 | +12.47 / +9.90 (n = 60/60) | −0.62 / +0.51 | +12.47 / +9.90 (p<0.05: 46/60, 14/60) | −0.01 / +0.19 | **watermark обнаружен** (OpenStamp + GaussMark) |
+| [`report_Swift-Qwen3.8-27B-RCO_IQ3_S.json`](data/report_Swift-Qwen3.8-27B-RCO_IQ3_S.json) | Swift-Qwen3.8-27B-RCO | Qwen3.8-27B-GSQ-RCO | IQ3_S | +2.53 / +4.43 (n = 35/60) | −0.81 / +0.28 | +2.53 / +4.43 (p<0.05: 0/0, 2/2) | −0.71 / −0.61 | **watermark обнаружен в noreason** (2/4: OpenStamp + GaussMark) |
+| [`report_OrcaSAQ-2-27B-Uncensored.json`](data/report_OrcaSAQ-2-27B-Uncensored.json) | OrcaSAQ-2-27B-Uncensored | Qwen3.8-27B-GSQ-RCO | OrcaSAQ | +2.37 / +9.13 (n = 46/60) | −0.06 / −0.87 | +2.37 / +9.13 (p<0.05: 3/46, 26/60) | −0.67 / −0.89 | **watermark обнаружен в noreason** (2/4: OpenStamp + GaussMark) |
 
 Значения в столбцах — t-сводка (спаренный t-критерий): reasoning on / reasoning off.
 
@@ -106,21 +111,50 @@ python3 status.py                                      # статус прого
 |---|---|---|
 | [![gsq](data/watermark_report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.png)](data/watermark_report_Swift-1.5-Qwen3.8-27B-GSQ-RCO_IQ3_S.png) | [![rco](data/watermark_report_Swift-Qwen3.8-27B-RCO_IQ3_S.png)](data/watermark_report_Swift-Qwen3.8-27B-RCO_IQ3_S.png) | [![7b](data/watermark_report_qwen2.5-7b-openstamp-L251_Q8_0.png)](data/watermark_report_qwen2.5-7b-openstamp-L251_Q8_0.png) |
 
+| OrcaSAQ-2-27B-Uncensored vs Qwen3.8-27B-GSQ-RCO (OrcaSAQ) |
+|---|
+| [![orca](data/watermark_report_OrcaSAQ-2-27B-Uncensored.png)](data/watermark_report_OrcaSAQ-2-27B-Uncensored.png) |
+
 - **27B-прогон GSQ** (60 промптов; в reason n = 38 из 60): watermark
-  не обнаружен — максимум t = +2.89 (OpenStamp/GaussMark, noreason),
+  не обнаружен — максимум t = +2.80 (OpenStamp/GaussMark, noreason),
   ниже порога t ≥ 3; G ≈ 0.50 с обеих сторон.
 - **27B-прогон RCO** (60 промптов × 2 режима; в reason исключено 25
-  текстов с пустым выходом): в reasoning off два детектора
+  текстов с пустым выходом, n = 35): в reasoning off два детектора
   (OpenStamp + GaussMark — одна и та же статистика первого порядка)
-  дают t = +3.56, в reasoning on — нет (t = +2.88 < 3). SynthID и
-  MarkLLM E2E не реагируют (G ≈ 0.50; E2E P ≈ 0.28 с обеих сторон).
+  дают t = +4.43 (z = +5.04) — выше порога t ≥ 3, в reasoning on — нет
+  (t = +2.53 < 3). SynthID и MarkLLM E2E не реагируют (G ≈ 0.50; E2E
+  P ≈ 0.27–0.30 с обеих сторон).
 - **7B-прогон** (60 промптов × 2 режима) — позитивный контроль: модель
   явно watermarked OpenStamp (delta=1.0, L=251). OpenStamp и
-  GaussMark обнаруживают watermark в обоих режимах (t = +13.72 /
-  +9.80, почти все разности положительные; GaussMark: 50/60 текстов
-  с p < 0.05 в reason). SynthID (дефолтный ключ) и MarkLLM E2E — нет,
-  что согласуется с тем, что watermark в этой модели — не SynthID,
-  а E2E-детектор обучен на иных схемах (KGW/UNW на opt-1.3b).
+  GaussMark обнаруживают watermark в обоих режимах (t = +12.47 /
+  +9.90, почти все разности положительные; GaussMark: 46/60 текстов
+  с p < 0.05 в reason, 14/60 в noreason). SynthID (дефолтный ключ) и
+  MarkLLM E2E — нет, что согласуется с тем, что watermark в этой
+  модели — не SynthID, а E2E-детектор обучен на иных схемах (KGW/UNW
+  на opt-1.3b).
+- **OrcaSAQ-2-прогон** (60 промптов × 2 режима, 1200 токенов,
+  llama.cpp CUDA/RTX 3090): OrcaSAQ-2-27B-Uncensored — квантизация
+  OrcaSAQ того же Qwen3.8-27B-GSQ-RCO (см. imatrix-метаданные GGUF),
+  т.е. «watermark» — структурное смещение весов от самой схемы
+  квантизации. В reasoning off два детектора первого порядка
+  (OpenStamp LLR и GaussMark — одна и та же статистика) дают
+  t = +9.13 (z = +12.86), 57/60 разностей положительные, 26/60
+  текстов с p < 0.05: структурный след OrcaSAQ-квантизации
+  детектируется. В reasoning on сигнал слабее (t = +2.37 < 3, n = 46 —
+  14/60 промптов исчерпали 1200 токенов на thinking, пустой вывод
+  исключён). SynthID (дефолтный ключ) и MarkLLM E2E не реагируют
+  (G ≈ 0.50 с обеих сторон) — как и в остальных прогонах, след не
+  SynthID- и не KGW/UNW-типа.
+
+Пересчёт L (30.09.2026, llama.cpp CUDA-сборка): прежние значения L
+(ранние прогоны) включали хвостовой EOG и, у старой CPU-сборки
+llama.cpp, токены, сгенерированные после завершения GBNF-грамматики
+(до `max_tokens`). В пересчёте L содержит только текст-токены (EOG
+исключён), как в референсе openstamp/src/llr.py (проверка —
+`test_llr.py`); тексты и token_ids сохранены, доскорена только L.
+Смещение t в позитивном контроле (+13.72 → +12.47) и в RCO
+(+3.56 → +4.43) объясняется вычтенным хвостом; вердикты детекторов,
+не использующих L (SynthID, E2E), не изменились.
 
 ## Лицензия
 
